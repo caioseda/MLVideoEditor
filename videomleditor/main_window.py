@@ -21,6 +21,8 @@ from PySide6.QtWidgets import (
     QTreeWidgetItem,
     QPlainTextEdit,
     QFrame,
+    QButtonGroup,
+    QInputDialog,
 )
 
 from .player_controller import VideoPlayerController
@@ -40,7 +42,7 @@ class MainWindow(QMainWindow):
         self._current_frame = 0
         self._shortcuts: dict[str, QShortcut] = {}
         self._fit_pending = False
-        self._saved_frames: list[int] = []
+        self._saved_frames: list[dict[str, int | str | None]] = []
         self._tree_root: QTreeWidgetItem | None = None
 
         self.setAcceptDrops(True)
@@ -69,35 +71,62 @@ class MainWindow(QMainWindow):
         # Left panel: tree of frames/geometries
         left_panel = QVBoxLayout()
         left_panel.setSpacing(6)
+        left_header = QHBoxLayout()
+        left_header.setSpacing(4)
         left_label = QLabel("Frames de interesse", self)
+        self._edit_frame_btn = QPushButton("✏", self)
+        self._edit_frame_btn.setFixedSize(28, 24)
+        self._edit_frame_btn.setToolTip("Renomear frame selecionado")
+        self._delete_frame_btn = QPushButton("🗑", self)
+        self._delete_frame_btn.setFixedSize(28, 24)
+        self._delete_frame_btn.setToolTip("Remover frame selecionado")
+        left_header.addWidget(left_label)
+        left_header.addStretch(1)
+        left_header.addWidget(self._edit_frame_btn)
+        left_header.addWidget(self._delete_frame_btn)
         self._frames_tree = QTreeWidget(self)
         self._frames_tree.setHeaderHidden(True)
         self._tree_root = QTreeWidgetItem(["Frames"])
         self._frames_tree.addTopLevelItem(self._tree_root)
         self._frames_tree.expandAll()
-        left_panel.addWidget(left_label)
+        left_panel.addLayout(left_header)
         left_panel.addWidget(self._frames_tree, stretch=1)
 
         # Center panel: tools, metadata, video, timeline, controls
         center_panel = QVBoxLayout()
         center_panel.setSpacing(8)
 
-        # Tool bar row
+        # Open row centered above toolbar
+        self._open_btn = QPushButton(self._icon_for_style(QStyle.SP_DirOpenIcon), "Abrir vídeo", self)
+        self._open_btn.setToolTip("Abrir arquivo .mp4 ou .avi")
+        self._open_btn.setIconSize(QSize(22, 22))
+        self._open_btn.setMinimumWidth(120)
+        open_row = QHBoxLayout()
+        open_row.addStretch(1)
+        open_row.addWidget(self._open_btn)
+        open_row.addStretch(1)
+        center_panel.addLayout(open_row)
+
+        # Tool bar row (selection + hand)
         tool_row = QHBoxLayout()
         tool_row.setSpacing(6)
-        self._open_btn = QPushButton(self._icon_for_style(QStyle.SP_DirOpenIcon), "", self)
-        self._open_btn.setToolTip("Abrir arquivo .mp4 ou .avi")
-        self._hand_btn = QPushButton(self._icon_for_style(QStyle.SP_ArrowUp), "", self)
+        self._selection_btn = QPushButton("🖱", self)
+        self._selection_btn.setCheckable(True)
+        self._selection_btn.setToolTip("Seleção (cursor)")
+        self._hand_btn = QPushButton("✋", self)
         self._hand_btn.setCheckable(True)
         self._hand_btn.setToolTip("Mover o vídeo quando houver zoom")
-        self._loop_checkbox = QCheckBox("Loop", self)
-        self._loop_checkbox.setToolTip("Repetir vídeo ao finalizar")
-        for button in (self._open_btn, self._hand_btn):
+        for button in (self._selection_btn, self._hand_btn):
             button.setIconSize(QSize(20, 20))
-            button.setMaximumWidth(34)
-        tool_row.addWidget(self._open_btn)
+            button.setMaximumWidth(36)
+        self._tool_group = QButtonGroup(self)
+        self._tool_group.setExclusive(True)
+        self._tool_group.addButton(self._selection_btn)
+        self._tool_group.addButton(self._hand_btn)
+        self._selection_btn.setChecked(True)
+        tool_row.addStretch(1)
+        tool_row.addWidget(self._selection_btn)
         tool_row.addWidget(self._hand_btn)
-        tool_row.addWidget(self._loop_checkbox)
         tool_row.addStretch(1)
         center_panel.addLayout(tool_row)
 
@@ -132,12 +161,14 @@ class MainWindow(QMainWindow):
         # Playback controls row
         controls_layout = QHBoxLayout()
         controls_layout.setSpacing(8)
+        self._loop_checkbox = QCheckBox("Loop", self)
+        self._loop_checkbox.setToolTip("Repetir vídeo ao finalizar")
         self._start_btn = QPushButton(self._icon_for_style(QStyle.SP_MediaSkipBackward), "", self)
         self._back_frame_btn = QPushButton(self._icon_for_style(QStyle.SP_MediaSeekBackward), "", self)
         self._play_btn = QPushButton(self._icon_for_style(QStyle.SP_MediaPlay), "", self)
         self._forward_frame_btn = QPushButton(self._icon_for_style(QStyle.SP_MediaSeekForward), "", self)
         self._end_btn = QPushButton(self._icon_for_style(QStyle.SP_MediaSkipForward), "", self)
-        self._save_frame_btn = QPushButton(self._icon_for_style(QStyle.SP_DialogSaveButton), "", self)
+        self._save_frame_btn = QPushButton(self._icon_for_style(QStyle.SP_DialogSaveButton), "Salvar frame", self)
 
         for button in (
             self._start_btn,
@@ -159,6 +190,7 @@ class MainWindow(QMainWindow):
         self._end_btn.setToolTip("Fim")
         self._save_frame_btn.setToolTip("Salvar frame de interesse")
 
+        controls_layout.addWidget(self._loop_checkbox)
         controls_layout.addStretch(1)
         controls_layout.addWidget(self._start_btn)
         controls_layout.addWidget(self._back_frame_btn)
@@ -205,10 +237,13 @@ class MainWindow(QMainWindow):
         self._forward_frame_btn.clicked.connect(lambda: self._player_controller.skip_frames(1))
         self._end_btn.clicked.connect(self._seek_to_end)
         self._play_btn.clicked.connect(self._toggle_play_pause)
-        self._hand_btn.toggled.connect(self._video_view.set_hand_mode)
+        self._hand_btn.toggled.connect(self._on_hand_toggled)
+        self._selection_btn.toggled.connect(self._on_selection_toggled)
         self._loop_checkbox.toggled.connect(self._player_controller.set_looping)
         self._save_frame_btn.clicked.connect(self._save_current_frame)
         self._frames_tree.itemClicked.connect(self._on_tree_item_clicked)
+        self._edit_frame_btn.clicked.connect(self._rename_selected_frame)
+        self._delete_frame_btn.clicked.connect(self._delete_selected_frame)
 
         self._position_slider.sliderPressed.connect(self._on_slider_pressed)
         self._position_slider.sliderReleased.connect(self._on_slider_released)
@@ -256,14 +291,15 @@ class MainWindow(QMainWindow):
         if self._tree_root:
             self._tree_root.takeChildren()
         self._update_controls_enabled(True)
-        self._play_btn.setText("Play")
         self._play_btn.setIcon(self._icon_for_style(QStyle.SP_MediaPlay))
+        self._selection_btn.setChecked(True)
         # Keep loop checkbox state as user preference; just re-apply to controller
         self._player_controller.set_looping(self._loop_checkbox.isChecked())
         self.setWindowTitle(f"VideoML Editor - {path.name}")
         self._file_label.setText(f"Vídeo: {path.name}")
         self._update_frame_label(0)
         self._update_properties("Nenhum item selecionado")
+        self._update_interest_actions_enabled()
 
     def _on_position_changed(self, position_ms: int) -> None:
         if not self._slider_is_active:
@@ -280,7 +316,6 @@ class MainWindow(QMainWindow):
     def _on_playback_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
         is_playing = state == QMediaPlayer.PlayingState
         self._play_btn.setEnabled(self._media_loaded)
-        self._play_btn.setText("Pause" if is_playing else "Play")
         self._play_btn.setIcon(self._icon_for_style(QStyle.SP_MediaPause if is_playing else QStyle.SP_MediaPlay))
         status_text = "Reproduzindo" if is_playing else "Pausado"
         self.statusBar().showMessage(status_text, 2000)
@@ -323,6 +358,8 @@ class MainWindow(QMainWindow):
             self._player_controller.set_position(value)
             self._update_time_label(value, self._position_slider.maximum())
             self._update_frame_label(value)
+            if self._selection_btn.isChecked():
+                self._update_properties(f"Frame atual: {self._current_frame}")
 
     # endregion
 
@@ -332,11 +369,13 @@ class MainWindow(QMainWindow):
         self._forward_frame_btn.setEnabled(enabled)
         self._play_btn.setEnabled(enabled)
         self._hand_btn.setEnabled(enabled)
+        self._selection_btn.setEnabled(True)
         self._start_btn.setEnabled(enabled)
         self._end_btn.setEnabled(enabled)
         self._loop_checkbox.setEnabled(True)  # allow toggling even without media
         self._save_frame_btn.setEnabled(enabled)
         self._frames_tree.setEnabled(enabled or bool(self._saved_frames))
+        self._update_interest_actions_enabled()
         if not enabled:
             self._hand_btn.setChecked(False)
             self._video_view.set_hand_mode(False)
@@ -362,30 +401,77 @@ class MainWindow(QMainWindow):
         frame = self._current_frame
         if frame < 0:
             return
-        if frame not in self._saved_frames:
-            self._saved_frames.append(frame)
-            self._add_frame_to_tree(frame)
+        if any(entry["frame"] == frame for entry in self._saved_frames):
+            return
 
-    def _add_frame_to_tree(self, frame: int) -> None:
+        self._saved_frames.append({"frame": frame, "name": None})
+        self._saved_frames.sort(key=lambda e: e["frame"])
+        self._rebuild_frames_tree()
+        self._update_interest_actions_enabled()
+
+    def _rebuild_frames_tree(self) -> None:
         if not self._tree_root:
             return
-        item = QTreeWidgetItem([f"Frame {frame}"])
-        item.setData(0, Qt.UserRole, frame)
-        self._tree_root.addChild(item)
+        selected_frame = None
+        current = self._frames_tree.currentItem()
+        if current is not None:
+            selected_frame = current.data(0, Qt.UserRole)
+
+        self._tree_root.takeChildren()
+        for entry in self._saved_frames:
+            item = QTreeWidgetItem()
+            item.setData(0, Qt.UserRole, entry["frame"])
+            self._tree_root.addChild(item)
+            self._decorate_tree_item(item, entry)
         self._frames_tree.expandAll()
+        if selected_frame is not None:
+            for i in range(self._tree_root.childCount()):
+                child = self._tree_root.child(i)
+                if child.data(0, Qt.UserRole) == selected_frame:
+                    self._frames_tree.setCurrentItem(child)
+                    break
+
+    def _decorate_tree_item(self, item: QTreeWidgetItem, entry: dict[str, int | str | None]) -> None:
+        wrapper = QWidget(self._frames_tree)
+        layout = QVBoxLayout(wrapper)
+        layout.setContentsMargins(4, 2, 4, 2)
+        layout.setSpacing(0)
+
+        frame = entry["frame"]
+        name = entry.get("name")
+
+        name_label = QLabel(wrapper)
+        name_label.setText(name if name else f"Frame {frame}")
+        if name:
+            font = name_label.font()
+            font.setBold(True)
+            name_label.setFont(font)
+
+        layout.addWidget(name_label)
+
+        if name:
+            frame_label = QLabel(f"Frame {frame}", wrapper)
+            frame_label.setStyleSheet("color: #666666; font-size: 11px;")
+            layout.addWidget(frame_label)
+
+        wrapper.setLayout(layout)
+        self._frames_tree.setItemWidget(item, 0, wrapper)
 
     def _on_tree_item_clicked(self, item: QTreeWidgetItem) -> None:
         frame = item.data(0, Qt.UserRole)
         if frame is None:
             self._update_properties("Nenhum item selecionado")
+            self._update_interest_actions_enabled()
             return
         if not self._media_loaded:
+            self._update_interest_actions_enabled()
             return
         position_ms = self._frame_to_ms(int(frame))
         self._player_controller.set_position(position_ms)
         self._update_frame_label(position_ms)
         self._update_time_label(position_ms, self._position_slider.maximum())
         self._update_properties(f"Frame: {frame}")
+        self._update_interest_actions_enabled()
 
     def _is_supported_video(self, path: Path) -> bool:
         return path.suffix.lower() in {".mp4", ".avi"}
@@ -487,11 +573,58 @@ class MainWindow(QMainWindow):
             self._update_time_label(duration, duration)
             self._update_frame_label(duration)
 
+    def _rename_selected_frame(self) -> None:
+        item = self._frames_tree.currentItem()
+        if not item:
+            return
+        frame = item.data(0, Qt.UserRole)
+        if frame is None:
+            return
+        entry = next((e for e in self._saved_frames if e["frame"] == frame), None)
+        if entry is None:
+            return
+        current_name = entry.get("name") or ""
+        name, ok = QInputDialog.getText(self, "Renomear frame", "Nome:", text=current_name)
+        if not ok:
+            return
+        entry["name"] = name.strip() or None
+        self._rebuild_frames_tree()
+        self._update_interest_actions_enabled()
+
+    def _delete_selected_frame(self) -> None:
+        item = self._frames_tree.currentItem()
+        if not item:
+            return
+        frame = item.data(0, Qt.UserRole)
+        if frame is None:
+            return
+        self._saved_frames = [e for e in self._saved_frames if e["frame"] != frame]
+        self._rebuild_frames_tree()
+        self._update_interest_actions_enabled()
+        self._update_properties("Nenhum item selecionado")
+
     def _has_selected_interest(self) -> bool:
         item = self._frames_tree.currentItem()
         if not item:
             return False
         return item.data(0, Qt.UserRole) is not None
+
+    def _on_selection_toggled(self, checked: bool) -> None:
+        if checked:
+            self._video_view.set_hand_mode(False)
+            self._hand_btn.setChecked(False)
+            self._video_view.viewport().setCursor(Qt.ArrowCursor)
+
+    def _on_hand_toggled(self, checked: bool) -> None:
+        self._video_view.set_hand_mode(checked)
+        if checked:
+            self._selection_btn.setChecked(False)
+
+    def _update_interest_actions_enabled(self) -> None:
+        selected = self._frames_tree.currentItem()
+        has_frame = bool(selected and selected.data(0, Qt.UserRole) is not None)
+        self._edit_frame_btn.setEnabled(has_frame)
+        self._delete_frame_btn.setEnabled(has_frame)
 
     def _handle_invalid_media(self) -> None:
         self._media_loaded = False
