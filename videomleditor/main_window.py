@@ -107,7 +107,7 @@ class MainWindow(QMainWindow):
         open_row.addStretch(1)
         center_panel.addLayout(open_row)
 
-        # Tool bar row (selection + hand)
+        # Tool bar row (selection + hand + geometry tools)
         tool_row = QHBoxLayout()
         tool_row.setSpacing(6)
         self._selection_btn = QPushButton("🖱", self)
@@ -116,17 +116,62 @@ class MainWindow(QMainWindow):
         self._hand_btn = QPushButton("✋", self)
         self._hand_btn.setCheckable(True)
         self._hand_btn.setToolTip("Mover o vídeo quando houver zoom")
-        for button in (self._selection_btn, self._hand_btn):
+
+        # Geometry tools
+        self._point_btn = QPushButton("●", self)
+        self._point_btn.setCheckable(True)
+        self._point_btn.setToolTip("Desenhar ponto")
+        self._line_btn = QPushButton("╱", self)
+        self._line_btn.setCheckable(True)
+        self._line_btn.setToolTip("Desenhar reta")
+        self._angle_btn = QPushButton("∠", self)
+        self._angle_btn.setCheckable(True)
+        self._angle_btn.setToolTip("Desenhar ângulo")
+        self._freehand_btn = QPushButton("◌", self)
+        self._freehand_btn.setCheckable(True)
+        self._freehand_btn.setToolTip("Máscara free hand")
+        self._brush_btn = QPushButton("🖌", self)
+        self._brush_btn.setCheckable(True)
+        self._brush_btn.setToolTip("Brush")
+
+        for button in (
+            self._selection_btn,
+            self._hand_btn,
+            self._point_btn,
+            self._line_btn,
+            self._angle_btn,
+            self._freehand_btn,
+            self._brush_btn,
+        ):
             button.setIconSize(QSize(20, 20))
             button.setMaximumWidth(36)
+
         self._tool_group = QButtonGroup(self)
         self._tool_group.setExclusive(True)
         self._tool_group.addButton(self._selection_btn)
         self._tool_group.addButton(self._hand_btn)
+        self._tool_group.addButton(self._point_btn)
+        self._tool_group.addButton(self._line_btn)
+        self._tool_group.addButton(self._angle_btn)
+        self._tool_group.addButton(self._freehand_btn)
+        self._tool_group.addButton(self._brush_btn)
         self._selection_btn.setChecked(True)
+        
         tool_row.addStretch(1)
         tool_row.addWidget(self._selection_btn)
         tool_row.addWidget(self._hand_btn)
+
+        # Separador visual entre navegação e geometria
+        tool_separator = QFrame(self)
+        tool_separator.setFrameShape(QFrame.VLine)
+        tool_separator.setFrameShadow(QFrame.Sunken)
+        tool_row.addWidget(tool_separator)
+
+        tool_row.addWidget(self._point_btn)
+        tool_row.addWidget(self._line_btn)
+        tool_row.addWidget(self._angle_btn)
+        tool_row.addWidget(self._freehand_btn)
+        tool_row.addWidget(self._brush_btn)
         tool_row.addStretch(1)
         center_panel.addLayout(tool_row)
 
