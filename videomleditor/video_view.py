@@ -1,13 +1,30 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QPainter, QTransform
+import math
+
+from PySide6.QtCore import Qt, Signal, QPointF, QRectF
+from PySide6.QtGui import QPainter, QTransform, QBrush, QPen, QColor, QPainterPath
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
-from PySide6.QtWidgets import QGraphicsScene, QGraphicsView
+from PySide6.QtWidgets import (
+    QGraphicsScene,
+    QGraphicsView,
+    QGraphicsEllipseItem,
+    QGraphicsLineItem,
+    QGraphicsPathItem,
+)
 
 
 class VideoView(QGraphicsView):
     """Graphics-based video view with zoom and pan support."""
+    
+    annotation_requested = Signal(float, float)  # Emits video coordinates (x, y) for point
+    line_completed = Signal(float, float, float, float)  # Emits (x1, y1, x2, y2) for line
+    angle_completed = Signal(float, float, float, float, float, float)  # Emits (x1, y1, x2, y2, x3, y3)
+    angle_preview_changed = Signal(float)  # Emits current angle in degrees during drawing
+    
+    # Mask signals
+    freehand_completed = Signal(object)  # Emits QPainterPath for freehand shape
+    brush_stroke_completed = Signal(object)  # Emits QPainterPath for brush stroke
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -26,6 +43,50 @@ class VideoView(QGraphicsView):
 
         self.setDragMode(QGraphicsView.NoDrag)
         self.setAcceptDrops(True)
+        self.setMouseTracking(True)  # Enable mouse tracking for brush preview
+
+        # Annotation management
+        self._annotations: list[dict] = []
+        self._annotation_items: list = []  # Can hold ellipses, lines, etc.
+        self._annotation_mode: bool = False
+        
+        # Current tool mode
+        self._current_tool: str = "selection"  # "selection", "hand", "point", "line", "angle", "freehand", "brush"
+        
+        # Line drawing state
+        self._line_start_point: QPointF | None = None
+        self._line_preview_item: QGraphicsLineItem | None = None
+        self._line_is_dragging: bool = False
+        self._line_guide_enabled: bool = False
+        self._line_preview_color: QColor = QColor("yellow")
+        self._line_preview_width: int = 2
+        
+        # Angle drawing state
+        self._angle_points: list[QPointF] = []  # Stores p1, p2, then p3
+        self._angle_preview_lines: list[QGraphicsLineItem] = []  # Preview lines
+        self._angle_preview_color: QColor = QColor("yellow")
+        self._angle_preview_width: int = 2
+        self._shift_pressed: bool = False
+        
+        # Freehand drawing state
+        self._freehand_points: list[QPointF] = []
+        self._freehand_preview_item: QGraphicsPathItem | None = None
+        self._freehand_color: QColor = QColor("yellow")
+        self._freehand_width: int = 2
+        self._freehand_is_drawing: bool = False
+        
+        # Brush drawing state
+        self._brush_diameter: int = 5
+        self._brush_color: QColor = QColor("yellow")
+        self._brush_width: int = 2
+        self._brush_preview_item: QGraphicsEllipseItem | None = None
+        self._brush_stroke_path: QPainterPath | None = None
+        self._brush_stroke_preview_item: QGraphicsPathItem | None = None
+        self._brush_is_drawing: bool = False
+        self._brush_last_point: QPointF | None = None
+        
+        # Mask display
+        self._mask_item: QGraphicsPathItem | None = None
 
     @property
     def video_item(self) -> QGraphicsVideoItem:
@@ -38,6 +99,10 @@ class VideoView(QGraphicsView):
         rect = self._video_item.boundingRect()
         if rect.isEmpty():
             return False
+        
+        # Fix the scene rect to prevent automatic expansion when items are added
+        self._fix_scene_rect()
+        
         self.fitInView(self._video_item, Qt.KeepAspectRatio)
         return True
 
@@ -46,6 +111,54 @@ class VideoView(QGraphicsView):
         self.setDragMode(QGraphicsView.ScrollHandDrag if enabled else QGraphicsView.NoDrag)
         cursor = Qt.OpenHandCursor if enabled else Qt.ArrowCursor
         self.viewport().setCursor(cursor)
+
+    def set_current_tool(self, tool: str) -> None:
+        """Set the current tool and cancel any in-progress drawing."""
+        if self._current_tool != tool:
+            self._cancel_line_drawing()
+            self._cancel_angle_drawing()
+            self._cancel_freehand_drawing()
+            self._cancel_brush_drawing()
+            self._remove_brush_preview()
+        self._current_tool = tool
+
+    def set_line_guide_enabled(self, enabled: bool) -> None:
+        """Enable or disable line guide preview."""
+        self._line_guide_enabled = enabled
+
+    def set_line_preview_style(self, color: QColor, width: int) -> None:
+        """Set the style for line preview."""
+        self._line_preview_color = color
+        self._line_preview_width = width
+
+    def set_angle_preview_style(self, color: QColor, width: int) -> None:
+        """Set the style for angle preview."""
+        self._angle_preview_color = color
+        self._angle_preview_width = width
+
+    def set_freehand_style(self, color: QColor, width: int) -> None:
+        """Set the style for freehand drawing."""
+        self._freehand_color = color
+        self._freehand_width = width
+
+    def set_brush_style(self, color: QColor, width: int, diameter: int) -> None:
+        """Set the style for brush drawing."""
+        self._brush_color = color
+        self._brush_width = width
+        self._brush_diameter = diameter
+        # Update preview if exists
+        if self._brush_preview_item is not None:
+            self._update_brush_preview_style()
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key_Shift:
+            self._shift_pressed = True
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event) -> None:
+        if event.key() == Qt.Key_Shift:
+            self._shift_pressed = False
+        super().keyReleaseEvent(event)
 
     def wheelEvent(self, event) -> None:
         angle = event.angleDelta().y()
@@ -70,9 +183,670 @@ class VideoView(QGraphicsView):
     def mousePressEvent(self, event) -> None:
         if self._hand_enabled and event.button() == Qt.LeftButton:
             self.viewport().setCursor(Qt.ClosedHandCursor)
+            super().mousePressEvent(event)
+            return
+        
+        # Handle annotation click
+        if event.button() == Qt.LeftButton and not self._hand_enabled:
+            x, y = self._map_to_video_coords(event.pos())
+            
+            # Point tool
+            if self._current_tool == "point":
+                if self._is_inside_video(x, y):
+                    self.annotation_requested.emit(x, y)
+                    event.accept()
+                    return
+            
+            # Line tool
+            elif self._current_tool == "line":
+                if self._line_start_point is None:
+                    # First click - start the line (must be inside video)
+                    if self._is_inside_video(x, y):
+                        self._line_start_point = QPointF(x, y)
+                        self._line_is_dragging = True
+                        event.accept()
+                        return
+                else:
+                    # Second click - complete the line
+                    x, y = self._clamp_to_video_bounds(x, y)
+                    self.line_completed.emit(
+                        self._line_start_point.x(),
+                        self._line_start_point.y(),
+                        x,
+                        y
+                    )
+                    self._cancel_line_drawing()
+                    event.accept()
+                    return
+            
+            # Angle tool
+            elif self._current_tool == "angle":
+                x, y = self._clamp_to_video_bounds(x, y)
+                
+                if len(self._angle_points) == 0:
+                    # First click - p1 (must be inside video)
+                    if self._is_inside_video(x, y):
+                        self._angle_points.append(QPointF(x, y))
+                        event.accept()
+                        return
+                elif len(self._angle_points) == 1:
+                    # Second click - p2
+                    self._angle_points.append(QPointF(x, y))
+                    event.accept()
+                    return
+                elif len(self._angle_points) == 2:
+                    # Third click - p3, complete the angle
+                    p1 = self._angle_points[0]
+                    p2 = self._angle_points[1]
+                    
+                    # Apply perpendicular constraint if shift is pressed
+                    if self._shift_pressed:
+                        x, y = self._project_to_perpendicular(p1, p2, x, y)
+                    
+                    x, y = self._clamp_to_video_bounds(x, y)
+                    
+                    self.angle_completed.emit(
+                        p1.x(), p1.y(),
+                        p2.x(), p2.y(),
+                        x, y
+                    )
+                    self._cancel_angle_drawing()
+                    event.accept()
+                    return
+            
+            # Freehand tool
+            elif self._current_tool == "freehand":
+                if self._is_inside_video(x, y):
+                    self._freehand_is_drawing = True
+                    self._freehand_points = [QPointF(x, y)]
+                    event.accept()
+                    return
+            
+            # Brush tool
+            elif self._current_tool == "brush":
+                if self._is_inside_video(x, y):
+                    self._brush_is_drawing = True
+                    self._brush_last_point = QPointF(x, y)
+                    # Start a new stroke path with the first circle
+                    self._brush_stroke_path = self._create_circle_path(x, y, self._brush_diameter / 2)
+                    self._update_brush_stroke_preview()
+                    event.accept()
+                    return
+        
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        x, y = self._map_to_video_coords(event.pos())
+        
+        # Update line preview if drawing
+        if self._current_tool == "line" and self._line_start_point is not None:
+            if self._line_guide_enabled or self._line_is_dragging:
+                x, y = self._clamp_to_video_bounds(x, y)
+                self._update_line_preview(x, y)
+        
+        # Update angle preview if drawing
+        elif self._current_tool == "angle" and len(self._angle_points) > 0:
+            # Apply perpendicular constraint if shift is pressed and we have 2 points
+            if self._shift_pressed and len(self._angle_points) == 2:
+                p1 = self._angle_points[0]
+                p2 = self._angle_points[1]
+                x, y = self._project_to_perpendicular(p1, p2, x, y)
+            
+            x, y = self._clamp_to_video_bounds(x, y)
+            self._update_angle_preview(x, y)
+        
+        # Update freehand preview if drawing
+        elif self._current_tool == "freehand" and self._freehand_is_drawing:
+            x, y = self._clamp_to_video_bounds(x, y)
+            self._freehand_points.append(QPointF(x, y))
+            self._update_freehand_preview()
+        
+        # Update brush preview (always when brush tool is active)
+        elif self._current_tool == "brush":
+            x, y = self._clamp_to_video_bounds(x, y)
+            self._update_brush_cursor_preview(x, y)
+            
+            # If drawing, add circles along the path
+            if self._brush_is_drawing and self._brush_last_point is not None:
+                # Add circles along the path from last point to current point
+                self._add_brush_stroke_segment(self._brush_last_point.x(), self._brush_last_point.y(), x, y)
+                self._brush_last_point = QPointF(x, y)
+                self._update_brush_stroke_preview()
+        
+        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
         if self._hand_enabled and event.button() == Qt.LeftButton:
             self.viewport().setCursor(Qt.OpenHandCursor)
+            super().mouseReleaseEvent(event)
+            return
+        
+        # Handle line tool release
+        if event.button() == Qt.LeftButton and self._current_tool == "line":
+            if self._line_start_point is not None and self._line_is_dragging:
+                x, y = self._map_to_video_coords(event.pos())
+                x, y = self._clamp_to_video_bounds(x, y)
+                
+                start = self._line_start_point
+                distance = abs(x - start.x()) + abs(y - start.y())
+                
+                if distance > 5:
+                    # User dragged enough → create line immediately
+                    self.line_completed.emit(start.x(), start.y(), x, y)
+                    self._cancel_line_drawing()
+                else:
+                    # User clicked without dragging → switch to click-click mode
+                    self._line_is_dragging = False
+                    if not self._line_guide_enabled and self._line_preview_item is not None:
+                        self._scene.removeItem(self._line_preview_item)
+                        self._line_preview_item = None
+                
+                event.accept()
+                return
+        
+        # Handle freehand tool release
+        if event.button() == Qt.LeftButton and self._current_tool == "freehand":
+            if self._freehand_is_drawing and len(self._freehand_points) > 2:
+                # Create closed path from points
+                path = self._create_freehand_path()
+                if not path.isEmpty():
+                    self.freehand_completed.emit(path)
+            self._cancel_freehand_drawing()
+            event.accept()
+            return
+        
+        # Handle brush tool release
+        if event.button() == Qt.LeftButton and self._current_tool == "brush":
+            if self._brush_is_drawing and self._brush_stroke_path is not None:
+                if not self._brush_stroke_path.isEmpty():
+                    self.brush_stroke_completed.emit(self._brush_stroke_path)
+            self._cancel_brush_drawing()
+            event.accept()
+            return
+        
         super().mouseReleaseEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        """Remove brush preview when mouse leaves the view."""
+        if self._current_tool == "brush":
+            self._remove_brush_preview()
+        super().leaveEvent(event)
+
+    def enterEvent(self, event) -> None:
+        """Restore brush preview when mouse enters the view."""
+        # Preview will be created on next mouse move
+        super().enterEvent(event)
+
+    # ==================== Line methods ====================
+    
+    def _update_line_preview(self, end_x: float, end_y: float) -> None:
+        """Update or create the line preview."""
+        if self._line_start_point is None:
+            return
+        
+        start = self._line_start_point
+        
+        if self._line_preview_item is None:
+            self._line_preview_item = QGraphicsLineItem()
+            pen = QPen(self._line_preview_color)
+            pen.setWidth(self._line_preview_width)
+            pen.setCosmetic(True)
+            self._line_preview_item.setPen(pen)
+            self._line_preview_item.setZValue(101)
+            self._scene.addItem(self._line_preview_item)
+        
+        self._line_preview_item.setLine(start.x(), start.y(), end_x, end_y)
+
+    def _cancel_line_drawing(self) -> None:
+        """Cancel any in-progress line drawing."""
+        self._line_start_point = None
+        self._line_is_dragging = False
+        if self._line_preview_item is not None:
+            self._scene.removeItem(self._line_preview_item)
+            self._line_preview_item = None
+
+    # ==================== Angle methods ====================
+
+    def _project_to_perpendicular(self, p1: QPointF, p2: QPointF, x: float, y: float) -> tuple[float, float]:
+        """Project point (x, y) onto the line perpendicular to p1-p2 passing through p2."""
+        # Direction vector of p1-p2
+        dx = p2.x() - p1.x()
+        dy = p2.y() - p1.y()
+        
+        # Handle degenerate case (p1 == p2)
+        if abs(dx) < 0.001 and abs(dy) < 0.001:
+            return x, y
+        
+        # Perpendicular direction (rotate 90 degrees)
+        perp_dx = -dy
+        perp_dy = dx
+        
+        # Normalize perpendicular vector
+        length = math.sqrt(perp_dx * perp_dx + perp_dy * perp_dy)
+        perp_dx /= length
+        perp_dy /= length
+        
+        # Vector from p2 to cursor
+        vx = x - p2.x()
+        vy = y - p2.y()
+        
+        # Project onto perpendicular direction
+        dot = vx * perp_dx + vy * perp_dy
+        
+        # Return projected point
+        return p2.x() + dot * perp_dx, p2.y() + dot * perp_dy
+
+    def _update_angle_preview(self, end_x: float, end_y: float) -> None:
+        """Update the angle preview lines."""
+        # Clear existing preview lines
+        for item in self._angle_preview_lines:
+            self._scene.removeItem(item)
+        self._angle_preview_lines.clear()
+        
+        if len(self._angle_points) == 0:
+            return
+        
+        pen = QPen(self._angle_preview_color)
+        pen.setWidth(self._angle_preview_width)
+        pen.setCosmetic(True)
+        
+        if len(self._angle_points) == 1:
+            # Drawing first line (p1 to cursor)
+            p1 = self._angle_points[0]
+            line = QGraphicsLineItem(p1.x(), p1.y(), end_x, end_y)
+            line.setPen(pen)
+            line.setZValue(101)
+            self._scene.addItem(line)
+            self._angle_preview_lines.append(line)
+        
+        elif len(self._angle_points) == 2:
+            # Drawing second line (p2 to cursor), also show first line
+            p1 = self._angle_points[0]
+            p2 = self._angle_points[1]
+            
+            # First line (p1 to p2)
+            line1 = QGraphicsLineItem(p1.x(), p1.y(), p2.x(), p2.y())
+            line1.setPen(pen)
+            line1.setZValue(101)
+            self._scene.addItem(line1)
+            self._angle_preview_lines.append(line1)
+            
+            # Second line (p2 to cursor/p3)
+            line2 = QGraphicsLineItem(p2.x(), p2.y(), end_x, end_y)
+            line2.setPen(pen)
+            line2.setZValue(101)
+            self._scene.addItem(line2)
+            self._angle_preview_lines.append(line2)
+            
+            # Calculate and emit angle
+            angle = self._calculate_angle(p1, p2, QPointF(end_x, end_y))
+            self.angle_preview_changed.emit(angle)
+
+    def _calculate_angle(self, p1: QPointF, p2: QPointF, p3: QPointF) -> float:
+        """Calculate the angle at p2 formed by p1-p2-p3, always returning < 180 degrees."""
+        # Vectors from p2 to p1 and from p2 to p3
+        v1x = p1.x() - p2.x()
+        v1y = p1.y() - p2.y()
+        v2x = p3.x() - p2.x()
+        v2y = p3.y() - p2.y()
+        
+        # Calculate magnitudes
+        mag1 = math.sqrt(v1x * v1x + v1y * v1y)
+        mag2 = math.sqrt(v2x * v2x + v2y * v2y)
+        
+        if mag1 < 0.001 or mag2 < 0.001:
+            return 0.0
+        
+        # Calculate dot product and angle
+        dot = v1x * v2x + v1y * v2y
+        cos_angle = dot / (mag1 * mag2)
+        
+        # Clamp to avoid numerical errors
+        cos_angle = max(-1.0, min(1.0, cos_angle))
+        
+        angle_rad = math.acos(cos_angle)
+        angle_deg = math.degrees(angle_rad)
+        
+        # Ensure angle is always < 180
+        if angle_deg > 180:
+            angle_deg = 360 - angle_deg
+        
+        return angle_deg
+
+    def _cancel_angle_drawing(self) -> None:
+        """Cancel any in-progress angle drawing."""
+        self._angle_points.clear()
+        for item in self._angle_preview_lines:
+            self._scene.removeItem(item)
+        self._angle_preview_lines.clear()
+        # Emit -1 to clear the angle display
+        self.angle_preview_changed.emit(-1)
+
+    # ==================== Freehand methods ====================
+
+    def _create_freehand_path(self) -> QPainterPath:
+        """Create a closed QPainterPath from the freehand points."""
+        if len(self._freehand_points) < 3:
+            return QPainterPath()
+        
+        path = QPainterPath()
+        path.moveTo(self._freehand_points[0])
+        
+        for point in self._freehand_points[1:]:
+            path.lineTo(point)
+        
+        # Close the path
+        path.closeSubpath()
+        
+        return path
+
+    def _update_freehand_preview(self) -> None:
+        """Update the freehand preview path."""
+        if len(self._freehand_points) < 2:
+            return
+        
+        # Create or update preview item
+        path = QPainterPath()
+        path.moveTo(self._freehand_points[0])
+        for point in self._freehand_points[1:]:
+            path.lineTo(point)
+        # Show closing line
+        path.lineTo(self._freehand_points[0])
+        
+        if self._freehand_preview_item is None:
+            self._freehand_preview_item = QGraphicsPathItem()
+            pen = QPen(self._freehand_color)
+            pen.setWidth(self._freehand_width)
+            pen.setCosmetic(True)
+            self._freehand_preview_item.setPen(pen)
+            self._freehand_preview_item.setBrush(Qt.NoBrush)
+            self._freehand_preview_item.setZValue(101)
+            self._scene.addItem(self._freehand_preview_item)
+        
+        self._freehand_preview_item.setPath(path)
+
+    def _cancel_freehand_drawing(self) -> None:
+        """Cancel any in-progress freehand drawing."""
+        self._freehand_is_drawing = False
+        self._freehand_points.clear()
+        if self._freehand_preview_item is not None:
+            self._scene.removeItem(self._freehand_preview_item)
+            self._freehand_preview_item = None
+
+    # ==================== Brush methods ====================
+
+    def _create_circle_path(self, cx: float, cy: float, radius: float) -> QPainterPath:
+        """Create a circular QPainterPath centered at (cx, cy)."""
+        path = QPainterPath()
+        path.addEllipse(QPointF(cx, cy), radius, radius)
+        return path
+
+    def _add_brush_stroke_segment(self, x1: float, y1: float, x2: float, y2: float) -> None:
+        """Add circles along a line segment from (x1, y1) to (x2, y2)."""
+        if self._brush_stroke_path is None:
+            return
+        
+        radius = self._brush_diameter / 2
+        
+        # Calculate distance and number of circles needed
+        dx = x2 - x1
+        dy = y2 - y1
+        distance = math.sqrt(dx * dx + dy * dy)
+        
+        if distance < 0.1:
+            return
+        
+        # Add circles at regular intervals (smaller than radius for smooth line)
+        step = radius * 0.5  # 50% overlap for smooth stroke
+        num_steps = max(1, int(distance / step))
+        
+        for i in range(1, num_steps + 1):
+            t = i / num_steps
+            cx = x1 + t * dx
+            cy = y1 + t * dy
+            circle = self._create_circle_path(cx, cy, radius)
+            self._brush_stroke_path = self._brush_stroke_path.united(circle)
+
+    def _update_brush_cursor_preview(self, x: float, y: float) -> None:
+        """Update the brush cursor preview circle."""
+        radius = self._brush_diameter / 2
+        
+        if self._brush_preview_item is None:
+            self._brush_preview_item = QGraphicsEllipseItem(-radius, -radius, self._brush_diameter, self._brush_diameter)
+            pen = QPen(self._brush_color)
+            pen.setWidth(1)
+            pen.setCosmetic(True)
+            self._brush_preview_item.setPen(pen)
+            self._brush_preview_item.setBrush(Qt.NoBrush)
+            self._brush_preview_item.setZValue(102)
+            self._brush_preview_item.setFlag(QGraphicsEllipseItem.ItemIgnoresTransformations, True)
+            self._scene.addItem(self._brush_preview_item)
+        
+        self._brush_preview_item.setPos(x, y)
+
+    def _update_brush_preview_style(self) -> None:
+        """Update the brush preview circle style."""
+        if self._brush_preview_item is not None:
+            radius = self._brush_diameter / 2
+            self._brush_preview_item.setRect(-radius, -radius, self._brush_diameter, self._brush_diameter)
+            pen = QPen(self._brush_color)
+            pen.setWidth(1)
+            pen.setCosmetic(True)
+            self._brush_preview_item.setPen(pen)
+
+    def _update_brush_stroke_preview(self) -> None:
+        """Update the brush stroke preview."""
+        if self._brush_stroke_path is None:
+            return
+        
+        if self._brush_stroke_preview_item is None:
+            self._brush_stroke_preview_item = QGraphicsPathItem()
+            pen = QPen(self._brush_color)
+            pen.setWidth(self._brush_width)
+            pen.setCosmetic(True)
+            self._brush_stroke_preview_item.setPen(pen)
+            self._brush_stroke_preview_item.setBrush(Qt.NoBrush)
+            self._brush_stroke_preview_item.setZValue(101)
+            self._scene.addItem(self._brush_stroke_preview_item)
+        
+        self._brush_stroke_preview_item.setPath(self._brush_stroke_path)
+
+    def _remove_brush_preview(self) -> None:
+        """Remove the brush cursor preview."""
+        if self._brush_preview_item is not None:
+            self._scene.removeItem(self._brush_preview_item)
+            self._brush_preview_item = None
+
+    def _cancel_brush_drawing(self) -> None:
+        """Cancel any in-progress brush drawing."""
+        self._brush_is_drawing = False
+        self._brush_last_point = None
+        self._brush_stroke_path = None
+        if self._brush_stroke_preview_item is not None:
+            self._scene.removeItem(self._brush_stroke_preview_item)
+            self._brush_stroke_preview_item = None
+
+    # ==================== Common methods ====================
+
+    def _clamp_to_video_bounds(self, x: float, y: float) -> tuple[float, float]:
+        """Clamp coordinates to video bounds."""
+        rect = self._video_item.boundingRect()
+        x = max(rect.left(), min(rect.right(), x))
+        y = max(rect.top(), min(rect.bottom(), y))
+        return x, y
+
+    def set_annotation_mode(self, enabled: bool) -> None:
+        """Enable or disable annotation mode (clicking creates annotations)."""
+        self._annotation_mode = enabled
+
+    def set_annotations(self, annotations: list[dict]) -> None:
+        """Update the visible annotations on the video."""
+        # Clear existing annotation graphics
+        for item in self._annotation_items:
+            self._scene.removeItem(item)
+        self._annotation_items.clear()
+        
+        self._annotations = annotations
+        
+        # Draw new annotations
+        for annotation in annotations:
+            ann_type = annotation.get("type")
+            if ann_type == "point":
+                self._draw_point(annotation)
+            elif ann_type == "line":
+                self._draw_line(annotation)
+            elif ann_type == "angle":
+                self._draw_angle(annotation)
+        
+        # Fix scene rect to prevent unwanted scrolling
+        self._fix_scene_rect()
+
+    def set_mask(self, mask_data: dict | None) -> None:
+        """Update the visible mask on the video."""
+        # Clear existing mask
+        if self._mask_item is not None:
+            self._scene.removeItem(self._mask_item)
+            self._mask_item = None
+        
+        if mask_data is None:
+            self._fix_scene_rect()
+            return
+        
+        path = mask_data.get("path")
+        if path is None or path.isEmpty():
+            self._fix_scene_rect()
+            return
+        
+        width = mask_data.get("width", 2)
+        color = mask_data.get("color", QColor("yellow"))
+        
+        self._mask_item = QGraphicsPathItem(path)
+        pen = QPen(color)
+        pen.setWidth(width)
+        pen.setCosmetic(True)
+        self._mask_item.setPen(pen)
+        self._mask_item.setBrush(Qt.NoBrush)
+        self._mask_item.setZValue(100)
+        self._scene.addItem(self._mask_item)
+        
+        # Fix scene rect to prevent unwanted scrolling
+        self._fix_scene_rect()
+
+    def _draw_point(self, annotation: dict) -> None:
+        """Draw a point annotation on the scene."""
+        x = annotation.get("x", 0)
+        y = annotation.get("y", 0)
+        size = annotation.get("size", 3)
+        color = annotation.get("color", QColor("yellow"))
+        
+        half_size = size / 2
+        ellipse = QGraphicsEllipseItem(-half_size, -half_size, size, size)
+        ellipse.setBrush(QBrush(color))
+        ellipse.setPen(QPen(Qt.NoPen))
+        ellipse.setZValue(100)
+        ellipse.setPos(x, y)
+        ellipse.setFlag(QGraphicsEllipseItem.ItemIgnoresTransformations, True)
+        
+        self._scene.addItem(ellipse)
+        self._annotation_items.append(ellipse)
+
+    def _draw_line(self, annotation: dict) -> None:
+        """Draw a line annotation on the scene."""
+        x1 = annotation.get("x1", 0)
+        y1 = annotation.get("y1", 0)
+        x2 = annotation.get("x2", 0)
+        y2 = annotation.get("y2", 0)
+        width = annotation.get("width", 2)
+        color = annotation.get("color", QColor("yellow"))
+        
+        line = QGraphicsLineItem(x1, y1, x2, y2)
+        pen = QPen(color)
+        pen.setWidth(width)
+        pen.setCosmetic(True)
+        line.setPen(pen)
+        line.setZValue(100)
+        
+        self._scene.addItem(line)
+        self._annotation_items.append(line)
+
+    def _draw_angle(self, annotation: dict) -> None:
+        """Draw an angle annotation on the scene (two lines)."""
+        x1 = annotation.get("x1", 0)
+        y1 = annotation.get("y1", 0)
+        x2 = annotation.get("x2", 0)
+        y2 = annotation.get("y2", 0)
+        x3 = annotation.get("x3", 0)
+        y3 = annotation.get("y3", 0)
+        width = annotation.get("width", 2)
+        color = annotation.get("color", QColor("yellow"))
+        
+        pen = QPen(color)
+        pen.setWidth(width)
+        pen.setCosmetic(True)
+        
+        # Line from p1 to p2
+        line1 = QGraphicsLineItem(x1, y1, x2, y2)
+        line1.setPen(pen)
+        line1.setZValue(100)
+        self._scene.addItem(line1)
+        self._annotation_items.append(line1)
+        
+        # Line from p2 to p3
+        line2 = QGraphicsLineItem(x2, y2, x3, y3)
+        line2.setPen(pen)
+        line2.setZValue(100)
+        self._scene.addItem(line2)
+        self._annotation_items.append(line2)
+
+    def _map_to_video_coords(self, view_pos):
+        """Convert view coordinates to video item coordinates."""
+        scene_pos = self.mapToScene(view_pos)
+        video_pos = self._video_item.mapFromScene(scene_pos)
+        return video_pos.x(), video_pos.y()
+
+    def _is_inside_video(self, x: float, y: float) -> bool:
+        """Check if coordinates are within the video bounds."""
+        rect = self._video_item.boundingRect()
+        return rect.contains(x, y)
+    
+    def get_video_size(self) -> tuple[int, int]:
+        """Get the native video dimensions (original resolution)."""
+        native_size = self._video_item.nativeSize()
+        rect = self._video_item.boundingRect()
+        
+        # Prefer native size if valid
+        if native_size.isValid() and native_size.width() > 0 and native_size.height() > 0:
+            return int(native_size.width()), int(native_size.height())
+        
+        # Fallback to bounding rect
+        if not rect.isEmpty():
+            return int(rect.width()), int(rect.height())
+        
+        return 0, 0
+    
+    def get_display_size(self) -> tuple[int, int]:
+        """Get the current display size of the video item (may differ from native)."""
+        rect = self._video_item.boundingRect()
+        if not rect.isEmpty():
+            return int(rect.width()), int(rect.height())
+        return 0, 0
+    
+    def get_video_debug_info(self) -> dict:
+        """Get debug information about video dimensions."""
+        native_size = self._video_item.nativeSize()
+        rect = self._video_item.boundingRect()
+        return {
+            "native_valid": native_size.isValid(),
+            "native_width": native_size.width() if native_size.isValid() else 0,
+            "native_height": native_size.height() if native_size.isValid() else 0,
+            "boundingRect_width": rect.width(),
+            "boundingRect_height": rect.height(),
+            "boundingRect_left": rect.left(),
+            "boundingRect_top": rect.top(),
+        }
+    
+    def _fix_scene_rect(self) -> None:
+        """Fix the scene rect to the video bounds to prevent unwanted scrolling."""
+        scene_rect = self._video_item.sceneBoundingRect()
+        if not scene_rect.isEmpty():
+            self._scene.setSceneRect(scene_rect)
