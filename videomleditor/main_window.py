@@ -4,7 +4,7 @@ from pathlib import Path
 import math
 
 from PySide6.QtCore import Qt, QSize, QEvent
-from PySide6.QtGui import QAction, QIcon, QKeySequence, QShortcut
+from PySide6.QtGui import QAction, QIcon, QKeySequence, QShortcut, QPainterPath, QImage, QPainter, QColor, QTransform
 from PySide6.QtMultimedia import QMediaPlayer
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -29,8 +29,6 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QColorDialog,
 )
-
-from PySide6.QtGui import QColor
 
 from .player_controller import VideoPlayerController
 from .video_view import VideoView
@@ -65,9 +63,22 @@ class MainWindow(QMainWindow):
         self._angle_width: int = 2
         self._angle_color: QColor = QColor("yellow")
 
-        # Annotations storage: {frame_number: [{"type": "point", "x": float, "y": float, "size": int, "color": QColor, "name": str | None}, ...]}
+        # Freehand tool settings
+        self._freehand_width: int = 2
+        self._freehand_color: QColor = QColor("yellow")
+
+        # Brush tool settings
+        self._brush_width: int = 2
+        self._brush_color: QColor = QColor("yellow")
+        self._brush_diameter: int = 5
+
+        # Annotations storage: {frame_number: [{"type": "point", ...}, ...]}
         self._annotations: dict[int, list[dict]] = {}
         self._annotation_counter: dict[str, int] = {"point": 0, "line": 0, "angle": 0, "freehand": 0, "brush": 0}
+
+        # Masks storage: {frame_number: {"type": "mask", "path": QPainterPath, "width": int, "color": QColor, "name": str | None, "id": int}}
+        self._masks: dict[int, dict] = {}
+        self._mask_counter: int = 0
 
         self.setAcceptDrops(True)
 
@@ -110,6 +121,8 @@ class MainWindow(QMainWindow):
         left_header.addWidget(self._delete_frame_btn)
         self._frames_tree = QTreeWidget(self)
         self._frames_tree.setHeaderHidden(True)
+        self._frames_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._frames_tree.customContextMenuRequested.connect(self._show_tree_context_menu)
         self._tree_root = QTreeWidgetItem(["Frames"])
         self._frames_tree.addTopLevelItem(self._tree_root)
         self._frames_tree.expandAll()
@@ -162,11 +175,15 @@ class MainWindow(QMainWindow):
         
         self._freehand_btn = QPushButton("◌", self)
         self._freehand_btn.setCheckable(True)
-        self._freehand_btn.setToolTip("Máscara free hand")
+        self._freehand_btn.setToolTip("Máscara free hand (clique direito para configurar)")
+        self._freehand_btn.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._freehand_btn.customContextMenuRequested.connect(self._show_freehand_context_menu)
         
         self._brush_btn = QPushButton("🖌", self)
         self._brush_btn.setCheckable(True)
-        self._brush_btn.setToolTip("Brush")
+        self._brush_btn.setToolTip("Brush (clique direito para configurar)")
+        self._brush_btn.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._brush_btn.customContextMenuRequested.connect(self._show_brush_context_menu)
 
         for button in (
             self._selection_btn,
@@ -325,6 +342,8 @@ class MainWindow(QMainWindow):
         self._point_btn.toggled.connect(self._on_point_toggled)
         self._line_btn.toggled.connect(self._on_line_toggled)
         self._angle_btn.toggled.connect(self._on_angle_toggled)
+        self._freehand_btn.toggled.connect(self._on_freehand_toggled)
+        self._brush_btn.toggled.connect(self._on_brush_toggled)
 
         # Video view line completion
         self._video_view.line_completed.connect(self._on_line_completed)
@@ -332,6 +351,10 @@ class MainWindow(QMainWindow):
         # Video view angle signals
         self._video_view.angle_completed.connect(self._on_angle_completed)
         self._video_view.angle_preview_changed.connect(self._on_angle_preview_changed)
+        
+        # Video view mask signals
+        self._video_view.freehand_completed.connect(self._on_freehand_completed)
+        self._video_view.brush_stroke_completed.connect(self._on_brush_stroke_completed)
         
         self._loop_checkbox.toggled.connect(self._player_controller.set_looping)
         self._save_frame_btn.clicked.connect(self._save_current_frame)
@@ -385,6 +408,8 @@ class MainWindow(QMainWindow):
         self._media_loaded = True
         self._fit_pending = True
         self._saved_frames.clear()
+        self._annotations.clear()
+        self._masks.clear()
         if self._tree_root:
             self._tree_root.takeChildren()
         self._update_controls_enabled(True)
@@ -404,8 +429,9 @@ class MainWindow(QMainWindow):
         self._update_time_label(position_ms, self._position_slider.maximum())
         self._update_frame_label(position_ms)
         
-        # Update visible annotations for current frame
+        # Update visible annotations and mask for current frame
         self._video_view.set_annotations(self._annotations.get(self._current_frame, []))
+        self._video_view.set_mask(self._masks.get(self._current_frame))
 
     def _on_duration_changed(self, duration_ms: int) -> None:
         self._position_slider.setRange(0, max(0, duration_ms))
@@ -440,6 +466,8 @@ class MainWindow(QMainWindow):
         self._media_loaded = False
         self._fit_pending = False
         self._saved_frames.clear()
+        self._annotations.clear()
+        self._masks.clear()
         if self._tree_root:
             self._tree_root.takeChildren()
         self._update_properties("Nenhum item selecionado")
@@ -460,6 +488,8 @@ class MainWindow(QMainWindow):
             self._update_frame_label(value)
             if self._selection_btn.isChecked():
                 self._update_properties(f"Frame atual: {self._current_frame}")
+
+    # ==================== Context menus ====================
 
     def _show_point_context_menu(self, pos) -> None:
         """Show context menu for point tool configuration."""
@@ -644,6 +674,243 @@ class MainWindow(QMainWindow):
             self._angle_color = color
             self._video_view.set_angle_preview_style(self._angle_color, self._angle_width)
 
+    def _show_freehand_context_menu(self, pos) -> None:
+        """Show context menu for freehand tool configuration."""
+        menu = QMenu(self)
+        
+        # Width configuration
+        width_label = QLabel("  Espessura: ")
+        width_spinbox = QSpinBox()
+        width_spinbox.setRange(1, 20)
+        width_spinbox.setValue(self._freehand_width)
+        width_spinbox.valueChanged.connect(lambda val: setattr(self, '_freehand_width', val))
+        
+        width_layout = QHBoxLayout()
+        width_layout.addWidget(width_label)
+        width_layout.addWidget(width_spinbox)
+        width_layout.setContentsMargins(4, 4, 4, 4)
+        
+        width_widget = QWidget()
+        width_widget.setLayout(width_layout)
+        
+        width_action = QWidgetAction(menu)
+        width_action.setDefaultWidget(width_widget)
+        menu.addAction(width_action)
+        
+        menu.addSeparator()
+        
+        # Color configuration
+        color_action = menu.addAction("  Escolher cor...")
+        color_action.triggered.connect(self._choose_freehand_color)
+        
+        # Color preview
+        preview_label = QLabel("  Cor atual: ")
+        preview_box = QLabel("    ")
+        preview_box.setStyleSheet(f"background-color: {self._freehand_color.name()}; border: 1px solid black;")
+        
+        preview_layout = QHBoxLayout()
+        preview_layout.addWidget(preview_label)
+        preview_layout.addWidget(preview_box)
+        preview_layout.addStretch()
+        preview_layout.setContentsMargins(4, 4, 4, 4)
+        
+        preview_widget = QWidget()
+        preview_widget.setLayout(preview_layout)
+        
+        preview_action = QWidgetAction(menu)
+        preview_action.setDefaultWidget(preview_widget)
+        menu.addAction(preview_action)
+        
+        menu.exec(self._freehand_btn.mapToGlobal(pos))
+
+    def _choose_freehand_color(self) -> None:
+        """Open color dialog to choose freehand color."""
+        color = QColorDialog.getColor(self._freehand_color, self, "Escolher cor da máscara")
+        if color.isValid():
+            self._freehand_color = color
+            self._video_view.set_freehand_style(self._freehand_color, self._freehand_width)
+
+    def _show_brush_context_menu(self, pos) -> None:
+        """Show context menu for brush tool configuration."""
+        menu = QMenu(self)
+        
+        # Diameter configuration
+        diameter_label = QLabel("  Diâmetro: ")
+        diameter_spinbox = QSpinBox()
+        diameter_spinbox.setRange(1, 100)
+        diameter_spinbox.setValue(self._brush_diameter)
+        diameter_spinbox.valueChanged.connect(self._on_brush_diameter_changed)
+        
+        diameter_layout = QHBoxLayout()
+        diameter_layout.addWidget(diameter_label)
+        diameter_layout.addWidget(diameter_spinbox)
+        diameter_layout.setContentsMargins(4, 4, 4, 4)
+        
+        diameter_widget = QWidget()
+        diameter_widget.setLayout(diameter_layout)
+        
+        diameter_action = QWidgetAction(menu)
+        diameter_action.setDefaultWidget(diameter_widget)
+        menu.addAction(diameter_action)
+        
+        menu.addSeparator()
+        
+        # Width configuration
+        width_label = QLabel("  Espessura contorno: ")
+        width_spinbox = QSpinBox()
+        width_spinbox.setRange(1, 20)
+        width_spinbox.setValue(self._brush_width)
+        width_spinbox.valueChanged.connect(lambda val: setattr(self, '_brush_width', val))
+        
+        width_layout = QHBoxLayout()
+        width_layout.addWidget(width_label)
+        width_layout.addWidget(width_spinbox)
+        width_layout.setContentsMargins(4, 4, 4, 4)
+        
+        width_widget = QWidget()
+        width_widget.setLayout(width_layout)
+        
+        width_action = QWidgetAction(menu)
+        width_action.setDefaultWidget(width_widget)
+        menu.addAction(width_action)
+        
+        menu.addSeparator()
+        
+        # Color configuration
+        color_action = menu.addAction("  Escolher cor...")
+        color_action.triggered.connect(self._choose_brush_color)
+        
+        # Color preview
+        preview_label = QLabel("  Cor atual: ")
+        preview_box = QLabel("    ")
+        preview_box.setStyleSheet(f"background-color: {self._brush_color.name()}; border: 1px solid black;")
+        
+        preview_layout = QHBoxLayout()
+        preview_layout.addWidget(preview_label)
+        preview_layout.addWidget(preview_box)
+        preview_layout.addStretch()
+        preview_layout.setContentsMargins(4, 4, 4, 4)
+        
+        preview_widget = QWidget()
+        preview_widget.setLayout(preview_layout)
+        
+        preview_action = QWidgetAction(menu)
+        preview_action.setDefaultWidget(preview_widget)
+        menu.addAction(preview_action)
+        
+        menu.exec(self._brush_btn.mapToGlobal(pos))
+
+    def _on_brush_diameter_changed(self, val: int) -> None:
+        """Handle brush diameter change."""
+        self._brush_diameter = val
+        self._video_view.set_brush_style(self._brush_color, self._brush_width, self._brush_diameter)
+
+    def _choose_brush_color(self) -> None:
+        """Open color dialog to choose brush color."""
+        color = QColorDialog.getColor(self._brush_color, self, "Escolher cor da brush")
+        if color.isValid():
+            self._brush_color = color
+            self._video_view.set_brush_style(self._brush_color, self._brush_width, self._brush_diameter)
+
+    def _show_tree_context_menu(self, pos) -> None:
+        """Show context menu for tree items."""
+        item = self._frames_tree.itemAt(pos)
+        if item is None:
+            return
+        
+        data = item.data(0, Qt.UserRole)
+        if data is None:
+            return
+        
+        # Check if it's a mask item
+        if isinstance(data, dict) and data.get("type") == "mask":
+            menu = QMenu(self)
+            export_action = menu.addAction("Criar máscara binária...")
+            export_action.triggered.connect(lambda: self._export_binary_mask(data.get("frame")))
+            menu.exec(self._frames_tree.mapToGlobal(pos))
+
+    def _export_binary_mask(self, frame: int) -> None:
+        """Export the mask for the given frame as a binary image."""
+        if frame is None or frame not in self._masks:
+            QMessageBox.warning(self, "Erro", "Nenhuma máscara encontrada para este frame.")
+            return
+        
+        mask_data = self._masks[frame]
+        path = mask_data.get("path")
+        if path is None or path.isEmpty():
+            QMessageBox.warning(self, "Erro", "Máscara vazia.")
+            return
+        
+        # Get display size - this is the coordinate system where the user drew
+        display_width, display_height = self._video_view.get_display_size()
+        
+        # Also get native size for reference
+        native_width, native_height = self._video_view.get_video_size()
+        
+        # Use display coordinates as the base - the path is in this coordinate system
+        if display_width <= 0 or display_height <= 0:
+            # Fallback: use the path's bounding rect
+            path_rect = path.boundingRect()
+            display_width = int(path_rect.right()) + 10
+            display_height = int(path_rect.bottom()) + 10
+        
+        if display_width <= 0 or display_height <= 0:
+            QMessageBox.warning(self, "Erro", "Não foi possível obter as dimensões do vídeo.")
+            return
+        
+        # Determine if we should use native resolution (if different and valid)
+        use_native = (native_width > 0 and native_height > 0 and 
+                      (native_width != display_width or native_height != display_height))
+        
+        if use_native:
+            final_width = native_width
+            final_height = native_height
+            scale_x = native_width / display_width
+            scale_y = native_height / display_height
+        else:
+            final_width = display_width
+            final_height = display_height
+            scale_x = 1.0
+            scale_y = 1.0
+        
+        # Ask for save location
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Salvar máscara binária",
+            str(Path.home() / f"mask_frame_{frame}.png"),
+            "Imagens PNG (*.png);;Todos os arquivos (*.*)",
+        )
+        if not file_path:
+            return
+        
+        # Create binary image
+        image = QImage(final_width, final_height, QImage.Format_Grayscale8)
+        image.fill(0)  # Black background
+        
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        painter.setBrush(QColor(255, 255, 255))  # White fill
+        painter.setPen(Qt.NoPen)
+        
+        # Scale the path if using native resolution
+        if abs(scale_x - 1.0) > 0.001 or abs(scale_y - 1.0) > 0.001:
+            transform = QTransform()
+            transform.scale(scale_x, scale_y)
+            scaled_path = transform.map(path)
+            painter.drawPath(scaled_path)
+        else:
+            painter.drawPath(path)
+        
+        painter.end()
+        
+        # Save image
+        if image.save(file_path):
+            self.statusBar().showMessage(f"Máscara salva em: {file_path} ({final_width}x{final_height})", 5000)
+        else:
+            QMessageBox.warning(self, "Erro", "Não foi possível salvar a máscara.")
+
+    # ==================== Annotation handlers ====================
+
     def _on_annotation_requested(self, x: float, y: float) -> None:
         """Handle click on video view to create annotation based on active tool."""
         if not self._media_loaded:
@@ -805,6 +1072,110 @@ class MainWindow(QMainWindow):
             angle_deg = 360 - angle_deg
         
         return angle_deg
+
+    # ==================== Mask handlers ====================
+
+    def _on_freehand_completed(self, path: QPainterPath) -> None:
+        """Handle freehand shape completion from video view."""
+        if not self._media_loaded:
+            return
+        self._add_to_mask(path)
+
+    def _on_brush_stroke_completed(self, path: QPainterPath) -> None:
+        """Handle brush stroke completion from video view."""
+        if not self._media_loaded:
+            return
+        self._add_to_mask(path)
+
+    def _add_to_mask(self, new_path: QPainterPath) -> None:
+        """Add a new path to the mask for the current frame."""
+        frame = self._current_frame
+        
+        # Ensure frame exists in saved_frames
+        if not any(entry["frame"] == frame for entry in self._saved_frames):
+            self._saved_frames.append({"frame": frame, "name": None})
+            self._saved_frames.sort(key=lambda e: e["frame"])
+        
+        # Check if mask already exists for this frame
+        if frame in self._masks:
+            # Unite with existing mask
+            existing_path = self._masks[frame]["path"]
+            united_path = existing_path.united(new_path)
+            self._masks[frame]["path"] = united_path
+        else:
+            # Create new mask
+            self._mask_counter += 1
+            self._masks[frame] = {
+                "type": "mask",
+                "path": new_path,
+                "width": self._freehand_width if self._freehand_btn.isChecked() else self._brush_width,
+                "color": QColor(self._freehand_color if self._freehand_btn.isChecked() else self._brush_color),
+                "name": None,
+                "id": self._mask_counter,
+            }
+        
+        # Update tree and video view
+        self._rebuild_frames_tree()
+        self._video_view.set_mask(self._masks.get(frame))
+
+    # ==================== Tool toggle handlers ====================
+
+    def _on_selection_toggled(self, checked: bool) -> None:
+        if checked:
+            self._video_view.set_hand_mode(False)
+            self._video_view.set_current_tool("selection")
+            self._video_view.viewport().setCursor(Qt.ArrowCursor)
+
+    def _on_hand_toggled(self, checked: bool) -> None:
+        self._video_view.set_hand_mode(checked)
+        self._video_view.set_current_tool("hand" if checked else "selection")
+
+    def _on_point_toggled(self, checked: bool) -> None:
+        if checked:
+            self._video_view.set_hand_mode(False)
+            self._video_view.set_current_tool("point")
+            self._video_view.viewport().setCursor(Qt.CrossCursor)
+        else:
+            self._video_view.set_current_tool("selection")
+    
+    def _on_line_toggled(self, checked: bool) -> None:
+        if checked:
+            self._video_view.set_hand_mode(False)
+            self._video_view.set_current_tool("line")
+            self._video_view.set_line_guide_enabled(self._line_guide_enabled)
+            self._video_view.set_line_preview_style(self._line_color, self._line_width)
+            self._video_view.viewport().setCursor(Qt.CrossCursor)
+        else:
+            self._video_view.set_current_tool("selection")
+
+    def _on_angle_toggled(self, checked: bool) -> None:
+        if checked:
+            self._video_view.set_hand_mode(False)
+            self._video_view.set_current_tool("angle")
+            self._video_view.set_angle_preview_style(self._angle_color, self._angle_width)
+            self._video_view.viewport().setCursor(Qt.CrossCursor)
+        else:
+            self._video_view.set_current_tool("selection")
+            # Hide angle display when tool is deselected
+            self._angle_display_label.setVisible(False)
+
+    def _on_freehand_toggled(self, checked: bool) -> None:
+        if checked:
+            self._video_view.set_hand_mode(False)
+            self._video_view.set_current_tool("freehand")
+            self._video_view.set_freehand_style(self._freehand_color, self._freehand_width)
+            self._video_view.viewport().setCursor(Qt.CrossCursor)
+        else:
+            self._video_view.set_current_tool("selection")
+
+    def _on_brush_toggled(self, checked: bool) -> None:
+        if checked:
+            self._video_view.set_hand_mode(False)
+            self._video_view.set_current_tool("brush")
+            self._video_view.set_brush_style(self._brush_color, self._brush_width, self._brush_diameter)
+            self._video_view.viewport().setCursor(Qt.CrossCursor)
+        else:
+            self._video_view.set_current_tool("selection")
     
     # endregion
 
@@ -880,6 +1251,14 @@ class MainWindow(QMainWindow):
                 ann_item.setData(0, Qt.UserRole, {"type": "annotation", "frame": frame_num, "annotation": annotation})
                 frame_item.addChild(ann_item)
                 self._decorate_annotation_item(ann_item, annotation)
+            
+            # Add mask as a single child if exists
+            if frame_num in self._masks:
+                mask_data = self._masks[frame_num]
+                mask_item = QTreeWidgetItem()
+                mask_item.setData(0, Qt.UserRole, {"type": "mask", "frame": frame_num, "mask": mask_data})
+                frame_item.addChild(mask_item)
+                self._decorate_mask_item(mask_item, mask_data)
         
         self._frames_tree.expandAll()
         
@@ -926,6 +1305,35 @@ class MainWindow(QMainWindow):
         wrapper.setLayout(layout)
         self._frames_tree.setItemWidget(item, 0, wrapper)
 
+    def _decorate_mask_item(self, item: QTreeWidgetItem, mask_data: dict) -> None:
+        """Style a mask tree item."""
+        wrapper = QWidget(self._frames_tree)
+        layout = QHBoxLayout(wrapper)
+        layout.setContentsMargins(4, 2, 4, 2)
+        layout.setSpacing(4)
+        
+        mask_name = mask_data.get("name")
+        mask_color = mask_data.get("color", QColor("yellow"))
+        
+        # Mask symbol with color
+        symbol_label = QLabel("▣")
+        symbol_label.setStyleSheet(f"color: {mask_color.name()}; font-size: 14px;")
+        layout.addWidget(symbol_label)
+        
+        # Name or default
+        display_name = mask_name if mask_name else "Máscara"
+        
+        name_label = QLabel(display_name)
+        if mask_name:
+            font = name_label.font()
+            font.setBold(True)
+            name_label.setFont(font)
+        layout.addWidget(name_label)
+        
+        layout.addStretch()
+        wrapper.setLayout(layout)
+        self._frames_tree.setItemWidget(item, 0, wrapper)
+
     def _select_tree_item_by_data(self, data) -> None:
         """Find and select a tree item by its stored data."""
         def data_matches(stored_data, target_data) -> bool:
@@ -944,6 +1352,9 @@ class MainWindow(QMainWindow):
                     stored_ann = stored_data.get("annotation", {})
                     target_ann = target_data.get("annotation", {})
                     return stored_ann.get("id") == target_ann.get("id") and stored_ann.get("type") == target_ann.get("type")
+                # For masks, just match by frame (only one mask per frame)
+                if stored_data.get("type") == "mask":
+                    return True
                 return True
             return False
 
@@ -1014,6 +1425,9 @@ class MainWindow(QMainWindow):
         if item_type == "annotation":
             annotation = data.get("annotation", {})
             self._update_properties(self._format_annotation_properties(annotation))
+        elif item_type == "mask":
+            mask = data.get("mask", {})
+            self._update_properties(self._format_mask_properties(mask))
         else:
             self._update_properties(f"Frame: {frame}")
         
@@ -1072,6 +1486,32 @@ class MainWindow(QMainWindow):
             if color:
                 lines.append(f"Cor: {color.name()}")
 
+        return "\n".join(lines)
+
+    def _format_mask_properties(self, mask_data: dict) -> str:
+        """Format mask details for the properties panel."""
+        lines = []
+        lines.append("Tipo: Máscara")
+        
+        if mask_data.get("name"):
+            lines.append(f"Nome: {mask_data['name']}")
+        
+        lines.append(f"Espessura contorno: {mask_data.get('width', 2)}")
+        
+        color = mask_data.get('color')
+        if color:
+            lines.append(f"Cor: {color.name()}")
+        
+        # Calculate approximate area
+        path = mask_data.get("path")
+        if path is not None:
+            bounding_rect = path.boundingRect()
+            lines.append(f"Bounding box: {bounding_rect.width():.1f} x {bounding_rect.height():.1f} px")
+        
+        lines.append("")
+        lines.append("Clique direito na árvore para")
+        lines.append("exportar máscara binária.")
+        
         return "\n".join(lines)
 
     def _is_supported_video(self, path: Path) -> bool:
@@ -1244,6 +1684,21 @@ class MainWindow(QMainWindow):
             # Manually select the renamed item
             self._select_annotation_in_tree(frame, ann_id, ann_type)
             self._update_interest_actions_enabled()
+        
+        elif data.get("type") == "mask":
+            frame = data.get("frame")
+            if frame is None or frame not in self._masks:
+                return
+            
+            mask = self._masks[frame]
+            current_name = mask.get("name") or ""
+            name, ok = QInputDialog.getText(self, "Renomear máscara", "Nome:", text=current_name)
+            if not ok:
+                return
+            
+            mask["name"] = name.strip() or None
+            self._rebuild_frames_tree()
+            self._update_interest_actions_enabled()
 
     def _select_annotation_in_tree(self, frame: int, ann_id: int, ann_type: str) -> None:
         """Select a specific annotation in the tree by its identifiers."""
@@ -1277,17 +1732,24 @@ class MainWindow(QMainWindow):
             self._saved_frames = [e for e in self._saved_frames if e["frame"] != frame]
             if frame in self._annotations:
                 del self._annotations[frame]
+            if frame in self._masks:
+                del self._masks[frame]
         elif data.get("type") == "frame":
             frame = data["frame"]
             self._saved_frames = [e for e in self._saved_frames if e["frame"] != frame]
             if frame in self._annotations:
                 del self._annotations[frame]
+            if frame in self._masks:
+                del self._masks[frame]
         elif data.get("type") == "annotation":
             frame = data["frame"]
             annotation = data.get("annotation")
             if frame in self._annotations and annotation in self._annotations[frame]:
                 self._annotations[frame].remove(annotation)
-                # If no more annotations, keep the frame (user saved it for a reason)
+        elif data.get("type") == "mask":
+            frame = data["frame"]
+            if frame in self._masks:
+                del self._masks[frame]
         
         self._rebuild_frames_tree()
         self._update_interest_actions_enabled()
@@ -1295,6 +1757,7 @@ class MainWindow(QMainWindow):
         
         # Update video view
         self._video_view.set_annotations(self._annotations.get(self._current_frame, []))
+        self._video_view.set_mask(self._masks.get(self._current_frame))
 
     def _has_selected_interest(self) -> bool:
         item = self._frames_tree.currentItem()
@@ -1306,46 +1769,7 @@ class MainWindow(QMainWindow):
         # Accept both old format (int) and new format (dict with type)
         if isinstance(data, int):
             return True
-        return data.get("type") in ("frame", "annotation")
-
-    def _on_selection_toggled(self, checked: bool) -> None:
-        if checked:
-            self._video_view.set_hand_mode(False)
-            self._video_view.set_current_tool("selection")
-            self._video_view.viewport().setCursor(Qt.ArrowCursor)
-
-    def _on_hand_toggled(self, checked: bool) -> None:
-        self._video_view.set_hand_mode(checked)
-        self._video_view.set_current_tool("hand" if checked else "selection")
-
-    def _on_point_toggled(self, checked: bool) -> None:
-        if checked:
-            self._video_view.set_hand_mode(False)
-            self._video_view.set_current_tool("point")
-            self._video_view.viewport().setCursor(Qt.CrossCursor)
-        else:
-            self._video_view.set_current_tool("selection")
-    
-    def _on_line_toggled(self, checked: bool) -> None:
-        if checked:
-            self._video_view.set_hand_mode(False)
-            self._video_view.set_current_tool("line")
-            self._video_view.set_line_guide_enabled(self._line_guide_enabled)
-            self._video_view.set_line_preview_style(self._line_color, self._line_width)
-            self._video_view.viewport().setCursor(Qt.CrossCursor)
-        else:
-            self._video_view.set_current_tool("selection")
-
-    def _on_angle_toggled(self, checked: bool) -> None:
-        if checked:
-            self._video_view.set_hand_mode(False)
-            self._video_view.set_current_tool("angle")
-            self._video_view.set_angle_preview_style(self._angle_color, self._angle_width)
-            self._video_view.viewport().setCursor(Qt.CrossCursor)
-        else:
-            self._video_view.set_current_tool("selection")
-            # Hide angle display when tool is deselected
-            self._angle_display_label.setVisible(False)
+        return data.get("type") in ("frame", "annotation", "mask")
 
     def _update_interest_actions_enabled(self) -> None:
         selected = self._frames_tree.currentItem()
@@ -1357,6 +1781,8 @@ class MainWindow(QMainWindow):
         self._media_loaded = False
         self._fit_pending = False
         self._saved_frames.clear()
+        self._annotations.clear()
+        self._masks.clear()
         if self._tree_root:
             self._tree_root.takeChildren()
         self._update_properties("Nenhum item selecionado")
