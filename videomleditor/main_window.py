@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import math
 
 from PySide6.QtCore import Qt, QSize, QEvent
 from PySide6.QtGui import QAction, QIcon, QKeySequence, QShortcut
@@ -50,9 +51,19 @@ class MainWindow(QMainWindow):
         self._fit_pending = False
         self._saved_frames: list[dict[str, int | str | None]] = []
         self._tree_root: QTreeWidgetItem | None = None
+        
         # Point tool settings
         self._point_size: int = 3
         self._point_color: QColor = QColor("yellow")
+
+        # Line tool settings
+        self._line_width: int = 2
+        self._line_color: QColor = QColor("yellow")
+        self._line_guide_enabled: bool = False
+
+        # Angle tool settings
+        self._angle_width: int = 2
+        self._angle_color: QColor = QColor("yellow")
 
         # Annotations storage: {frame_number: [{"type": "point", "x": float, "y": float, "size": int, "color": QColor, "name": str | None}, ...]}
         self._annotations: dict[int, list[dict]] = {}
@@ -136,15 +147,23 @@ class MainWindow(QMainWindow):
         self._point_btn.setToolTip("Desenhar ponto (clique direito para configurar)")
         self._point_btn.setContextMenuPolicy(Qt.CustomContextMenu)
         self._point_btn.customContextMenuRequested.connect(self._show_point_context_menu)
+        
         self._line_btn = QPushButton("╱", self)
         self._line_btn.setCheckable(True)
-        self._line_btn.setToolTip("Desenhar reta")
+        self._line_btn.setToolTip("Desenhar reta (clique direito para configurar)")
+        self._line_btn.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._line_btn.customContextMenuRequested.connect(self._show_line_context_menu)
+        
         self._angle_btn = QPushButton("∠", self)
         self._angle_btn.setCheckable(True)
-        self._angle_btn.setToolTip("Desenhar ângulo")
+        self._angle_btn.setToolTip("Desenhar ângulo (clique direito para configurar)\nSegure Shift para ângulo de 90°")
+        self._angle_btn.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._angle_btn.customContextMenuRequested.connect(self._show_angle_context_menu)
+        
         self._freehand_btn = QPushButton("◌", self)
         self._freehand_btn.setCheckable(True)
         self._freehand_btn.setToolTip("Máscara free hand")
+        
         self._brush_btn = QPushButton("🖌", self)
         self._brush_btn.setCheckable(True)
         self._brush_btn.setToolTip("Brush")
@@ -194,10 +213,14 @@ class MainWindow(QMainWindow):
         meta_row = QHBoxLayout()
         meta_row.setSpacing(10)
         self._file_label = QLabel("Vídeo: Nenhum arquivo", self)
+        self._angle_display_label = QLabel("", self)  # Shows angle during drawing
+        self._angle_display_label.setStyleSheet("color: #FF9800; font-weight: bold;")
+        self._angle_display_label.setVisible(False)
         self._time_label = QLabel("00:00.000 / 00:00.000", self)
         self._fps_label = QLabel("FPS: 0.00", self)
         self._frame_label = QLabel("Frame: 0", self)
         meta_row.addWidget(self._file_label, stretch=2)
+        meta_row.addWidget(self._angle_display_label, stretch=0)
         meta_row.addWidget(self._time_label, stretch=1)
         meta_row.addWidget(self._fps_label, stretch=0)
         meta_row.addWidget(self._frame_label, stretch=0)
@@ -300,6 +323,16 @@ class MainWindow(QMainWindow):
         self._hand_btn.toggled.connect(self._on_hand_toggled)
         self._selection_btn.toggled.connect(self._on_selection_toggled)
         self._point_btn.toggled.connect(self._on_point_toggled)
+        self._line_btn.toggled.connect(self._on_line_toggled)
+        self._angle_btn.toggled.connect(self._on_angle_toggled)
+
+        # Video view line completion
+        self._video_view.line_completed.connect(self._on_line_completed)
+
+        # Video view angle signals
+        self._video_view.angle_completed.connect(self._on_angle_completed)
+        self._video_view.angle_preview_changed.connect(self._on_angle_preview_changed)
+        
         self._loop_checkbox.toggled.connect(self._player_controller.set_looping)
         self._save_frame_btn.clicked.connect(self._save_current_frame)
         self._frames_tree.itemClicked.connect(self._on_tree_item_clicked)
@@ -483,6 +516,134 @@ class MainWindow(QMainWindow):
         if color.isValid():
             self._point_color = color
 
+    def _show_line_context_menu(self, pos) -> None:
+        """Show context menu for line tool configuration."""
+        menu = QMenu(self)
+        
+        # Guide line checkbox
+        guide_checkbox = QCheckBox("  Linha Guia")
+        guide_checkbox.setChecked(self._line_guide_enabled)
+        guide_checkbox.toggled.connect(self._on_line_guide_toggled)
+        
+        guide_action = QWidgetAction(menu)
+        guide_action.setDefaultWidget(guide_checkbox)
+        menu.addAction(guide_action)
+        
+        menu.addSeparator()
+        
+        # Width configuration
+        width_label = QLabel("  Espessura: ")
+        width_spinbox = QSpinBox()
+        width_spinbox.setRange(1, 20)
+        width_spinbox.setValue(self._line_width)
+        width_spinbox.valueChanged.connect(lambda val: setattr(self, '_line_width', val))
+        
+        width_layout = QHBoxLayout()
+        width_layout.addWidget(width_label)
+        width_layout.addWidget(width_spinbox)
+        width_layout.setContentsMargins(4, 4, 4, 4)
+        
+        width_widget = QWidget()
+        width_widget.setLayout(width_layout)
+        
+        width_action = QWidgetAction(menu)
+        width_action.setDefaultWidget(width_widget)
+        menu.addAction(width_action)
+        
+        menu.addSeparator()
+        
+        # Color configuration
+        color_action = menu.addAction("  Escolher cor...")
+        color_action.triggered.connect(self._choose_line_color)
+        
+        # Color preview
+        preview_label = QLabel("  Cor atual: ")
+        preview_box = QLabel("    ")
+        preview_box.setStyleSheet(f"background-color: {self._line_color.name()}; border: 1px solid black;")
+        
+        preview_layout = QHBoxLayout()
+        preview_layout.addWidget(preview_label)
+        preview_layout.addWidget(preview_box)
+        preview_layout.addStretch()
+        preview_layout.setContentsMargins(4, 4, 4, 4)
+        
+        preview_widget = QWidget()
+        preview_widget.setLayout(preview_layout)
+        
+        preview_action = QWidgetAction(menu)
+        preview_action.setDefaultWidget(preview_widget)
+        menu.addAction(preview_action)
+        
+        menu.exec(self._line_btn.mapToGlobal(pos))
+
+    def _on_line_guide_toggled(self, checked: bool) -> None:
+        """Toggle line guide preview."""
+        self._line_guide_enabled = checked
+        self._video_view.set_line_guide_enabled(checked)
+
+    def _choose_line_color(self) -> None:
+        """Open color dialog to choose line color."""
+        color = QColorDialog.getColor(self._line_color, self, "Escolher cor da reta")
+        if color.isValid():
+            self._line_color = color
+            self._video_view.set_line_preview_style(self._line_color, self._line_width)
+
+    def _show_angle_context_menu(self, pos) -> None:
+        """Show context menu for angle tool configuration."""
+        menu = QMenu(self)
+        
+        # Width configuration
+        width_label = QLabel("  Espessura: ")
+        width_spinbox = QSpinBox()
+        width_spinbox.setRange(1, 20)
+        width_spinbox.setValue(self._angle_width)
+        width_spinbox.valueChanged.connect(lambda val: setattr(self, '_angle_width', val))
+        
+        width_layout = QHBoxLayout()
+        width_layout.addWidget(width_label)
+        width_layout.addWidget(width_spinbox)
+        width_layout.setContentsMargins(4, 4, 4, 4)
+        
+        width_widget = QWidget()
+        width_widget.setLayout(width_layout)
+        
+        width_action = QWidgetAction(menu)
+        width_action.setDefaultWidget(width_widget)
+        menu.addAction(width_action)
+        
+        menu.addSeparator()
+        
+        # Color configuration
+        color_action = menu.addAction("  Escolher cor...")
+        color_action.triggered.connect(self._choose_angle_color)
+        
+        # Color preview
+        preview_label = QLabel("  Cor atual: ")
+        preview_box = QLabel("    ")
+        preview_box.setStyleSheet(f"background-color: {self._angle_color.name()}; border: 1px solid black;")
+        
+        preview_layout = QHBoxLayout()
+        preview_layout.addWidget(preview_label)
+        preview_layout.addWidget(preview_box)
+        preview_layout.addStretch()
+        preview_layout.setContentsMargins(4, 4, 4, 4)
+        
+        preview_widget = QWidget()
+        preview_widget.setLayout(preview_layout)
+        
+        preview_action = QWidgetAction(menu)
+        preview_action.setDefaultWidget(preview_widget)
+        menu.addAction(preview_action)
+        
+        menu.exec(self._angle_btn.mapToGlobal(pos))
+
+    def _choose_angle_color(self) -> None:
+        """Open color dialog to choose angle color."""
+        color = QColorDialog.getColor(self._angle_color, self, "Escolher cor do ângulo")
+        if color.isValid():
+            self._angle_color = color
+            self._video_view.set_angle_preview_style(self._angle_color, self._angle_width)
+
     def _on_annotation_requested(self, x: float, y: float) -> None:
         """Handle click on video view to create annotation based on active tool."""
         if not self._media_loaded:
@@ -521,6 +682,130 @@ class MainWindow(QMainWindow):
         self._rebuild_frames_tree()
         self._video_view.set_annotations(self._annotations.get(frame, []))
 
+    def _on_line_completed(self, x1: float, y1: float, x2: float, y2: float) -> None:
+        """Handle line completion from video view."""
+        if not self._media_loaded:
+            return
+        self._create_line_annotation(x1, y1, x2, y2)
+
+    def _create_line_annotation(self, x1: float, y1: float, x2: float, y2: float) -> None:
+        """Create a line annotation with the given coordinates."""
+        frame = self._current_frame
+        
+        # Ensure frame exists in saved_frames
+        if not any(entry["frame"] == frame for entry in self._saved_frames):
+            self._saved_frames.append({"frame": frame, "name": None})
+            self._saved_frames.sort(key=lambda e: e["frame"])
+        
+        # Initialize annotations list for this frame if needed
+        if frame not in self._annotations:
+            self._annotations[frame] = []
+        
+        # Increment counter and create annotation
+        self._annotation_counter["line"] += 1
+        annotation = {
+            "type": "line",
+            "x1": x1,
+            "y1": y1,
+            "x2": x2,
+            "y2": y2,
+            "width": self._line_width,
+            "color": QColor(self._line_color),  # Copy to preserve current settings
+            "name": None,
+            "id": self._annotation_counter["line"],
+        }
+        self._annotations[frame].append(annotation)
+        
+        # Update tree and video view
+        self._rebuild_frames_tree()
+        self._video_view.set_annotations(self._annotations.get(frame, []))
+    
+    def _on_angle_completed(self, x1: float, y1: float, x2: float, y2: float, x3: float, y3: float) -> None:
+        """Handle angle completion from video view."""
+        if not self._media_loaded:
+            return
+        self._create_angle_annotation(x1, y1, x2, y2, x3, y3)
+        # Hide angle display after creation
+        self._angle_display_label.setVisible(False)
+
+    def _on_angle_preview_changed(self, angle: float) -> None:
+        """Handle angle preview update during drawing."""
+        if angle < 0:
+            # -1 signals that no angle is being drawn
+            self._angle_display_label.setVisible(False)
+        else:
+            self._angle_display_label.setText(f"∠ {angle:.4f}°")
+            self._angle_display_label.setVisible(True)
+
+    def _create_angle_annotation(self, x1: float, y1: float, x2: float, y2: float, x3: float, y3: float) -> None:
+        """Create an angle annotation with the given coordinates."""
+        frame = self._current_frame
+        
+        # Ensure frame exists in saved_frames
+        if not any(entry["frame"] == frame for entry in self._saved_frames):
+            self._saved_frames.append({"frame": frame, "name": None})
+            self._saved_frames.sort(key=lambda e: e["frame"])
+        
+        # Initialize annotations list for this frame if needed
+        if frame not in self._annotations:
+            self._annotations[frame] = []
+        
+        # Calculate the angle
+        angle = self._calculate_angle_degrees(x1, y1, x2, y2, x3, y3)
+        
+        # Increment counter and create annotation
+        self._annotation_counter["angle"] += 1
+        annotation = {
+            "type": "angle",
+            "x1": x1,
+            "y1": y1,
+            "x2": x2,
+            "y2": y2,
+            "x3": x3,
+            "y3": y3,
+            "angle": angle,
+            "width": self._angle_width,
+            "color": QColor(self._angle_color),
+            "name": None,
+            "id": self._annotation_counter["angle"],
+        }
+        self._annotations[frame].append(annotation)
+        
+        # Update tree and video view
+        self._rebuild_frames_tree()
+        self._video_view.set_annotations(self._annotations.get(frame, []))
+
+    def _calculate_angle_degrees(self, x1: float, y1: float, x2: float, y2: float, x3: float, y3: float) -> float:
+        """Calculate the angle at p2 formed by p1-p2-p3, always returning < 180 degrees."""
+        # Vectors from p2 to p1 and from p2 to p3
+        v1x = x1 - x2
+        v1y = y1 - y2
+        v2x = x3 - x2
+        v2y = y3 - y2
+        
+        # Calculate magnitudes
+        mag1 = math.sqrt(v1x * v1x + v1y * v1y)
+        mag2 = math.sqrt(v2x * v2x + v2y * v2y)
+        
+        if mag1 < 0.001 or mag2 < 0.001:
+            return 0.0
+        
+        # Calculate dot product and angle
+        dot = v1x * v2x + v1y * v2y
+        cos_angle = dot / (mag1 * mag2)
+        
+        # Clamp to avoid numerical errors
+        cos_angle = max(-1.0, min(1.0, cos_angle))
+        
+        angle_rad = math.acos(cos_angle)
+        angle_deg = math.degrees(angle_rad)
+        
+        # Ensure angle is always < 180
+        if angle_deg > 180:
+            angle_deg = 360 - angle_deg
+        
+        return angle_deg
+    
     # endregion
 
     # region Helpers
@@ -617,8 +902,8 @@ class MainWindow(QMainWindow):
         symbols = {"point": "●", "line": "╱", "angle": "∠", "freehand": "◌", "brush": "🖌"}
         symbol = symbols.get(ann_type, "?")
         
-        # Color preview for point
-        if ann_type == "point":
+        # Color preview for point, line, and angle
+        if ann_type in ("point", "line", "angle"):
             color_label = QLabel(symbol)
             color_label.setStyleSheet(f"color: {annotation['color'].name()}; font-size: 14px;")
             layout.addWidget(color_label)
@@ -751,7 +1036,42 @@ class MainWindow(QMainWindow):
             color = annotation.get('color')
             if color:
                 lines.append(f"Cor: {color.name()}")
-    
+        
+        elif ann_type == "line":
+            x1, y1 = annotation.get('x1', 0), annotation.get('y1', 0)
+            x2, y2 = annotation.get('x2', 0), annotation.get('y2', 0)
+            lines.append(f"Início: ({x1:.1f}, {y1:.1f})")
+            lines.append(f"Fim: ({x2:.1f}, {y2:.1f})")
+            length = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+            lines.append(f"Comprimento: {length:.1f} px")
+            lines.append(f"Espessura: {annotation.get('width', 2)}")
+            color = annotation.get('color')
+            if color:
+                lines.append(f"Cor: {color.name()}")
+        
+        elif ann_type == "angle":
+            x1, y1 = annotation.get('x1', 0), annotation.get('y1', 0)
+            x2, y2 = annotation.get('x2', 0), annotation.get('y2', 0)
+            x3, y3 = annotation.get('x3', 0), annotation.get('y3', 0)
+            
+            lines.append(f"Ponto 1: ({x1:.1f}, {y1:.1f})")
+            lines.append(f"Vértice: ({x2:.1f}, {y2:.1f})")
+            lines.append(f"Ponto 3: ({x3:.1f}, {y3:.1f})")
+            
+            # Calculate line lengths
+            len1 = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+            len2 = math.sqrt((x3 - x2) ** 2 + (y3 - y2) ** 2)
+            lines.append(f"Comprimento reta 1: {len1:.1f} px")
+            lines.append(f"Comprimento reta 2: {len2:.1f} px")
+            
+            angle = annotation.get('angle', 0)
+            lines.append(f"Ângulo: {angle:.4f}°")
+            
+            lines.append(f"Espessura: {annotation.get('width', 2)}")
+            color = annotation.get('color')
+            if color:
+                lines.append(f"Cor: {color.name()}")
+
         return "\n".join(lines)
 
     def _is_supported_video(self, path: Path) -> bool:
@@ -991,23 +1311,41 @@ class MainWindow(QMainWindow):
     def _on_selection_toggled(self, checked: bool) -> None:
         if checked:
             self._video_view.set_hand_mode(False)
-            self._hand_btn.setChecked(False)
+            self._video_view.set_current_tool("selection")
             self._video_view.viewport().setCursor(Qt.ArrowCursor)
-            self._video_view.set_annotation_mode(False)
 
     def _on_hand_toggled(self, checked: bool) -> None:
         self._video_view.set_hand_mode(checked)
-        self._video_view.set_annotation_mode(False)
-        if checked:
-            self._selection_btn.setChecked(False)
+        self._video_view.set_current_tool("hand" if checked else "selection")
 
     def _on_point_toggled(self, checked: bool) -> None:
         if checked:
             self._video_view.set_hand_mode(False)
-            self._video_view.set_annotation_mode(True)
+            self._video_view.set_current_tool("point")
             self._video_view.viewport().setCursor(Qt.CrossCursor)
         else:
-            self._video_view.set_annotation_mode(False)
+            self._video_view.set_current_tool("selection")
+    
+    def _on_line_toggled(self, checked: bool) -> None:
+        if checked:
+            self._video_view.set_hand_mode(False)
+            self._video_view.set_current_tool("line")
+            self._video_view.set_line_guide_enabled(self._line_guide_enabled)
+            self._video_view.set_line_preview_style(self._line_color, self._line_width)
+            self._video_view.viewport().setCursor(Qt.CrossCursor)
+        else:
+            self._video_view.set_current_tool("selection")
+
+    def _on_angle_toggled(self, checked: bool) -> None:
+        if checked:
+            self._video_view.set_hand_mode(False)
+            self._video_view.set_current_tool("angle")
+            self._video_view.set_angle_preview_style(self._angle_color, self._angle_width)
+            self._video_view.viewport().setCursor(Qt.CrossCursor)
+        else:
+            self._video_view.set_current_tool("selection")
+            # Hide angle display when tool is deselected
+            self._angle_display_label.setVisible(False)
 
     def _update_interest_actions_enabled(self) -> None:
         selected = self._frames_tree.currentItem()
