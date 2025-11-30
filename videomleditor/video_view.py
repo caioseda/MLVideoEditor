@@ -99,6 +99,10 @@ class VideoView(QGraphicsView):
         rect = self._video_item.boundingRect()
         if rect.isEmpty():
             return False
+        
+        # Fix the scene rect to prevent automatic expansion when items are added
+        self._fix_scene_rect()
+        
         self.fitInView(self._video_item, Qt.KeepAspectRatio)
         return True
 
@@ -693,6 +697,9 @@ class VideoView(QGraphicsView):
                 self._draw_line(annotation)
             elif ann_type == "angle":
                 self._draw_angle(annotation)
+        
+        # Fix scene rect to prevent unwanted scrolling
+        self._fix_scene_rect()
 
     def set_mask(self, mask_data: dict | None) -> None:
         """Update the visible mask on the video."""
@@ -702,10 +709,12 @@ class VideoView(QGraphicsView):
             self._mask_item = None
         
         if mask_data is None:
+            self._fix_scene_rect()
             return
         
         path = mask_data.get("path")
         if path is None or path.isEmpty():
+            self._fix_scene_rect()
             return
         
         width = mask_data.get("width", 2)
@@ -719,6 +728,9 @@ class VideoView(QGraphicsView):
         self._mask_item.setBrush(Qt.NoBrush)
         self._mask_item.setZValue(100)
         self._scene.addItem(self._mask_item)
+        
+        # Fix scene rect to prevent unwanted scrolling
+        self._fix_scene_rect()
 
     def _draw_point(self, annotation: dict) -> None:
         """Draw a point annotation on the scene."""
@@ -818,3 +830,23 @@ class VideoView(QGraphicsView):
         if not rect.isEmpty():
             return int(rect.width()), int(rect.height())
         return 0, 0
+    
+    def get_video_debug_info(self) -> dict:
+        """Get debug information about video dimensions."""
+        native_size = self._video_item.nativeSize()
+        rect = self._video_item.boundingRect()
+        return {
+            "native_valid": native_size.isValid(),
+            "native_width": native_size.width() if native_size.isValid() else 0,
+            "native_height": native_size.height() if native_size.isValid() else 0,
+            "boundingRect_width": rect.width(),
+            "boundingRect_height": rect.height(),
+            "boundingRect_left": rect.left(),
+            "boundingRect_top": rect.top(),
+        }
+    
+    def _fix_scene_rect(self) -> None:
+        """Fix the scene rect to the video bounds to prevent unwanted scrolling."""
+        scene_rect = self._video_item.sceneBoundingRect()
+        if not scene_rect.isEmpty():
+            self._scene.setSceneRect(scene_rect)

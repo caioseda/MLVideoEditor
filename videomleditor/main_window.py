@@ -841,50 +841,61 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Erro", "Máscara vazia.")
             return
         
-        # Get display size - this is the coordinate system where the user drew
-        display_width, display_height = self._video_view.get_display_size()
-        
-        # Also get native size for reference
+        # Get all dimension info
         native_width, native_height = self._video_view.get_video_size()
+        display_width, display_height = self._video_view.get_display_size()
+        debug_info = self._video_view.get_video_debug_info()
         
-        # Use display coordinates as the base - the path is in this coordinate system
-        if display_width <= 0 or display_height <= 0:
-            # Fallback: use the path's bounding rect
-            path_rect = path.boundingRect()
-            display_width = int(path_rect.right()) + 10
-            display_height = int(path_rect.bottom()) + 10
+        # Get the boundingRect offset - this is crucial!
+        # The video item's boundingRect may not start at (0, 0)
+        rect_left = debug_info.get("boundingRect_left", 0)
+        rect_top = debug_info.get("boundingRect_top", 0)
         
+        path_rect = path.boundingRect()
+        
+        # Debug info for user
+        debug_msg = (
+            f"Informações de dimensões:\n\n"
+            f"Native size: {native_width}x{native_height}\n"
+            f"Display size (boundingRect): {display_width}x{display_height}\n"
+            f"BoundingRect offset: ({rect_left:.1f}, {rect_top:.1f})\n\n"
+            f"Path bounding rect:\n"
+            f"  De: ({path_rect.left():.1f}, {path_rect.top():.1f})\n"
+            f"  Até: ({path_rect.right():.1f}, {path_rect.bottom():.1f})\n\n"
+            f"Deseja continuar com a exportação?"
+        )
+        
+        reply = QMessageBox.question(
+            self, "Debug - Exportar Máscara", debug_msg,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+        )
+        if reply != QMessageBox.Yes:
+            return
+        
+        # Validate dimensions
         if display_width <= 0 or display_height <= 0:
             QMessageBox.warning(self, "Erro", "Não foi possível obter as dimensões do vídeo.")
             return
         
-        # Determine if we should use native resolution (if different and valid)
-        use_native = (native_width > 0 and native_height > 0 and 
-                      (native_width != display_width or native_height != display_height))
-        
-        if use_native:
-            final_width = native_width
-            final_height = native_height
-            scale_x = native_width / display_width
-            scale_y = native_height / display_height
+        # Determine output size (prefer native resolution)
+        if native_width > 0 and native_height > 0:
+            output_width = native_width
+            output_height = native_height
         else:
-            final_width = display_width
-            final_height = display_height
-            scale_x = 1.0
-            scale_y = 1.0
+            output_width = display_width
+            output_height = display_height
         
         # Ask for save location
         file_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Salvar máscara binária",
+            self, "Salvar máscara binária",
             str(Path.home() / f"mask_frame_{frame}.png"),
             "Imagens PNG (*.png);;Todos os arquivos (*.*)",
         )
         if not file_path:
             return
         
-        # Create binary image
-        image = QImage(final_width, final_height, QImage.Format_Grayscale8)
+        # Create binary image at output resolution
+        image = QImage(output_width, output_height, QImage.Format_Grayscale8)
         image.fill(0)  # Black background
         
         painter = QPainter(image)
@@ -892,20 +903,35 @@ class MainWindow(QMainWindow):
         painter.setBrush(QColor(255, 255, 255))  # White fill
         painter.setPen(Qt.NoPen)
         
-        # Scale the path if using native resolution
-        if abs(scale_x - 1.0) > 0.001 or abs(scale_y - 1.0) > 0.001:
-            transform = QTransform()
-            transform.scale(scale_x, scale_y)
-            scaled_path = transform.map(path)
-            painter.drawPath(scaled_path)
-        else:
-            painter.drawPath(path)
+        # Calculate scale factors
+        scale_x = output_width / display_width
+        scale_y = output_height / display_height
+        
+        # Build the transformation:
+        # We need: 1) subtract offset (normalize to 0,0), then 2) scale to output size
+        # 
+        # IMPORTANT: QTransform applies transformations in REVERSE order!
+        # So we must add scale FIRST, then translate, to get:
+        #   result = scale(translate(point))
+        #
+        # For point (47.3, 30) with offset (40, 0) and scale 2.133:
+        #   1. translate: (47.3 - 40, 30 - 0) = (7.3, 30)
+        #   2. scale: (7.3 * 2.133, 30 * 2.133) = (15.6, 64)
+        
+        transform = QTransform()
+        transform.scale(scale_x, scale_y)  # Applied SECOND (after translate)
+        transform.translate(-rect_left, -rect_top)  # Applied FIRST (normalize to 0,0)
+        
+        # Apply transformation and draw
+        transformed_path = transform.map(path)
+        painter.drawPath(transformed_path)
         
         painter.end()
         
         # Save image
         if image.save(file_path):
-            self.statusBar().showMessage(f"Máscara salva em: {file_path} ({final_width}x{final_height})", 5000)
+            msg = f"Salvo: {output_width}x{output_height} (offset: {rect_left:.0f},{rect_top:.0f}, scale: {scale_x:.2f}x{scale_y:.2f})"
+            self.statusBar().showMessage(msg, 8000)
         else:
             QMessageBox.warning(self, "Erro", "Não foi possível salvar a máscara.")
 
