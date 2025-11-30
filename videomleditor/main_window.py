@@ -23,7 +23,13 @@ from PySide6.QtWidgets import (
     QFrame,
     QButtonGroup,
     QInputDialog,
+    QMenu,
+    QWidgetAction,
+    QSpinBox,
+    QColorDialog,
 )
+
+from PySide6.QtGui import QColor
 
 from .player_controller import VideoPlayerController
 from .video_view import VideoView
@@ -44,6 +50,13 @@ class MainWindow(QMainWindow):
         self._fit_pending = False
         self._saved_frames: list[dict[str, int | str | None]] = []
         self._tree_root: QTreeWidgetItem | None = None
+        # Point tool settings
+        self._point_size: int = 3
+        self._point_color: QColor = QColor("yellow")
+
+        # Annotations storage: {frame_number: [{"type": "point", "x": float, "y": float, "size": int, "color": QColor, "name": str | None}, ...]}
+        self._annotations: dict[int, list[dict]] = {}
+        self._annotation_counter: dict[str, int] = {"point": 0, "line": 0, "angle": 0, "freehand": 0, "brush": 0}
 
         self.setAcceptDrops(True)
 
@@ -120,7 +133,9 @@ class MainWindow(QMainWindow):
         # Geometry tools
         self._point_btn = QPushButton("●", self)
         self._point_btn.setCheckable(True)
-        self._point_btn.setToolTip("Desenhar ponto")
+        self._point_btn.setToolTip("Desenhar ponto (clique direito para configurar)")
+        self._point_btn.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._point_btn.customContextMenuRequested.connect(self._show_point_context_menu)
         self._line_btn = QPushButton("╱", self)
         self._line_btn.setCheckable(True)
         self._line_btn.setToolTip("Desenhar reta")
@@ -156,7 +171,7 @@ class MainWindow(QMainWindow):
         self._tool_group.addButton(self._freehand_btn)
         self._tool_group.addButton(self._brush_btn)
         self._selection_btn.setChecked(True)
-        
+
         tool_row.addStretch(1)
         tool_row.addWidget(self._selection_btn)
         tool_row.addWidget(self._hand_btn)
@@ -284,11 +299,15 @@ class MainWindow(QMainWindow):
         self._play_btn.clicked.connect(self._toggle_play_pause)
         self._hand_btn.toggled.connect(self._on_hand_toggled)
         self._selection_btn.toggled.connect(self._on_selection_toggled)
+        self._point_btn.toggled.connect(self._on_point_toggled)
         self._loop_checkbox.toggled.connect(self._player_controller.set_looping)
         self._save_frame_btn.clicked.connect(self._save_current_frame)
         self._frames_tree.itemClicked.connect(self._on_tree_item_clicked)
         self._edit_frame_btn.clicked.connect(self._rename_selected_frame)
         self._delete_frame_btn.clicked.connect(self._delete_selected_frame)
+
+        # Video view click for annotations
+        self._video_view.annotation_requested.connect(self._on_annotation_requested)
 
         self._position_slider.sliderPressed.connect(self._on_slider_pressed)
         self._position_slider.sliderReleased.connect(self._on_slider_released)
@@ -351,6 +370,9 @@ class MainWindow(QMainWindow):
             self._position_slider.setValue(position_ms)
         self._update_time_label(position_ms, self._position_slider.maximum())
         self._update_frame_label(position_ms)
+        
+        # Update visible annotations for current frame
+        self._video_view.set_annotations(self._annotations.get(self._current_frame, []))
 
     def _on_duration_changed(self, duration_ms: int) -> None:
         self._position_slider.setRange(0, max(0, duration_ms))
@@ -406,6 +428,99 @@ class MainWindow(QMainWindow):
             if self._selection_btn.isChecked():
                 self._update_properties(f"Frame atual: {self._current_frame}")
 
+    def _show_point_context_menu(self, pos) -> None:
+        """Show context menu for point tool configuration."""
+        menu = QMenu(self)
+        
+        # Size configuration
+        size_label = QLabel("  Tamanho: ")
+        size_spinbox = QSpinBox()
+        size_spinbox.setRange(1, 50)
+        size_spinbox.setValue(self._point_size)
+        size_spinbox.valueChanged.connect(lambda val: setattr(self, '_point_size', val))
+        
+        size_layout = QHBoxLayout()
+        size_layout.addWidget(size_label)
+        size_layout.addWidget(size_spinbox)
+        size_layout.setContentsMargins(4, 4, 4, 4)
+        
+        size_widget = QWidget()
+        size_widget.setLayout(size_layout)
+        
+        size_action = QWidgetAction(menu)
+        size_action.setDefaultWidget(size_widget)
+        menu.addAction(size_action)
+        
+        menu.addSeparator()
+        
+        # Color configuration
+        color_action = menu.addAction("  Escolher cor...")
+        color_action.triggered.connect(self._choose_point_color)
+        
+        # Color preview
+        preview_label = QLabel(f"  Cor atual: ")
+        preview_box = QLabel("    ")
+        preview_box.setStyleSheet(f"background-color: {self._point_color.name()}; border: 1px solid black;")
+        
+        preview_layout = QHBoxLayout()
+        preview_layout.addWidget(preview_label)
+        preview_layout.addWidget(preview_box)
+        preview_layout.addStretch()
+        preview_layout.setContentsMargins(4, 4, 4, 4)
+        
+        preview_widget = QWidget()
+        preview_widget.setLayout(preview_layout)
+        
+        preview_action = QWidgetAction(menu)
+        preview_action.setDefaultWidget(preview_widget)
+        menu.addAction(preview_action)
+        
+        menu.exec(self._point_btn.mapToGlobal(pos))
+
+    def _choose_point_color(self) -> None:
+        """Open color dialog to choose point color."""
+        color = QColorDialog.getColor(self._point_color, self, "Escolher cor do ponto")
+        if color.isValid():
+            self._point_color = color
+
+    def _on_annotation_requested(self, x: float, y: float) -> None:
+        """Handle click on video view to create annotation based on active tool."""
+        if not self._media_loaded:
+            return
+        
+        if self._point_btn.isChecked():
+            self._create_point_annotation(x, y)
+
+    def _create_point_annotation(self, x: float, y: float) -> None:
+        """Create a point annotation at the given video coordinates."""
+        frame = self._current_frame
+        
+        # Ensure frame exists in saved_frames
+        if not any(entry["frame"] == frame for entry in self._saved_frames):
+            self._saved_frames.append({"frame": frame, "name": None})
+            self._saved_frames.sort(key=lambda e: e["frame"])
+        
+        # Initialize annotations list for this frame if needed
+        if frame not in self._annotations:
+            self._annotations[frame] = []
+        
+        # Increment counter and create annotation
+        self._annotation_counter["point"] += 1
+        annotation = {
+            "type": "point",
+            "x": x,
+            "y": y,
+            "size": self._point_size,
+            "color": QColor(self._point_color),  # Copy to preserve current settings
+            "name": None,
+            "id": self._annotation_counter["point"],
+        }
+        self._annotations[frame].append(annotation)
+        
+        # Update tree and video view
+        self._rebuild_frames_tree()
+        self._video_view.set_annotations(self._annotations.get(frame, []))
+
     # endregion
 
     # region Helpers
@@ -457,24 +572,109 @@ class MainWindow(QMainWindow):
     def _rebuild_frames_tree(self) -> None:
         if not self._tree_root:
             return
-        selected_frame = None
+        
+        # Store current selection
+        selected_data = None
         current = self._frames_tree.currentItem()
         if current is not None:
-            selected_frame = current.data(0, Qt.UserRole)
+            selected_data = current.data(0, Qt.UserRole)
 
         self._tree_root.takeChildren()
+        
         for entry in self._saved_frames:
-            item = QTreeWidgetItem()
-            item.setData(0, Qt.UserRole, entry["frame"])
-            self._tree_root.addChild(item)
-            self._decorate_tree_item(item, entry)
+            frame_num = entry["frame"]
+            frame_item = QTreeWidgetItem()
+            frame_item.setData(0, Qt.UserRole, {"type": "frame", "frame": frame_num})
+            self._tree_root.addChild(frame_item)
+            self._decorate_tree_item(frame_item, entry)
+            
+            # Add annotations as children of the frame
+            frame_annotations = self._annotations.get(frame_num, [])
+            for annotation in frame_annotations:
+                ann_item = QTreeWidgetItem()
+                ann_item.setData(0, Qt.UserRole, {"type": "annotation", "frame": frame_num, "annotation": annotation})
+                frame_item.addChild(ann_item)
+                self._decorate_annotation_item(ann_item, annotation)
+        
         self._frames_tree.expandAll()
-        if selected_frame is not None:
-            for i in range(self._tree_root.childCount()):
-                child = self._tree_root.child(i)
-                if child.data(0, Qt.UserRole) == selected_frame:
-                    self._frames_tree.setCurrentItem(child)
-                    break
+        
+        # Restore selection
+        if selected_data is not None:
+            self._select_tree_item_by_data(selected_data)
+
+    def _decorate_annotation_item(self, item: QTreeWidgetItem, annotation: dict) -> None:
+        """Style an annotation tree item."""
+        wrapper = QWidget(self._frames_tree)
+        layout = QHBoxLayout(wrapper)
+        layout.setContentsMargins(4, 2, 4, 2)
+        layout.setSpacing(4)
+        
+        ann_type = annotation["type"]
+        ann_id = annotation["id"]
+        ann_name = annotation.get("name")
+        
+        # Type symbol
+        symbols = {"point": "●", "line": "╱", "angle": "∠", "freehand": "◌", "brush": "🖌"}
+        symbol = symbols.get(ann_type, "?")
+        
+        # Color preview for point
+        if ann_type == "point":
+            color_label = QLabel(symbol)
+            color_label.setStyleSheet(f"color: {annotation['color'].name()}; font-size: 14px;")
+            layout.addWidget(color_label)
+        else:
+            symbol_label = QLabel(symbol)
+            layout.addWidget(symbol_label)
+        
+        # Name or default
+        type_names = {"point": "Ponto", "line": "Reta", "angle": "Ângulo", "freehand": "Máscara", "brush": "Brush"}
+        display_name = ann_name if ann_name else f"{type_names.get(ann_type, ann_type)} {ann_id}"
+        
+        name_label = QLabel(display_name)
+        if ann_name:
+            font = name_label.font()
+            font.setBold(True)
+            name_label.setFont(font)
+        layout.addWidget(name_label)
+        
+        layout.addStretch()
+        wrapper.setLayout(layout)
+        self._frames_tree.setItemWidget(item, 0, wrapper)
+
+    def _select_tree_item_by_data(self, data) -> None:
+        """Find and select a tree item by its stored data."""
+        def data_matches(stored_data, target_data) -> bool:
+            """Compare data by type and identifiers, not by full equality."""
+            if stored_data is None or target_data is None:
+                return stored_data is target_data
+            if isinstance(stored_data, int) and isinstance(target_data, int):
+                return stored_data == target_data
+            if isinstance(stored_data, dict) and isinstance(target_data, dict):
+                if stored_data.get("type") != target_data.get("type"):
+                    return False
+                if stored_data.get("frame") != target_data.get("frame"):
+                    return False
+                # For annotations, compare by id
+                if stored_data.get("type") == "annotation":
+                    stored_ann = stored_data.get("annotation", {})
+                    target_ann = target_data.get("annotation", {})
+                    return stored_ann.get("id") == target_ann.get("id") and stored_ann.get("type") == target_ann.get("type")
+                return True
+            return False
+
+        def find_item(parent):
+            for i in range(parent.childCount()):
+                child = parent.child(i)
+                if data_matches(child.data(0, Qt.UserRole), data):
+                    return child
+                found = find_item(child)
+                if found:
+                    return found
+            return None
+        
+        item = find_item(self._tree_root)
+        if item:
+            self._frames_tree.setCurrentItem(item)
 
     def _decorate_tree_item(self, item: QTreeWidgetItem, entry: dict[str, int | str | None]) -> None:
         wrapper = QWidget(self._frames_tree)
@@ -503,20 +703,56 @@ class MainWindow(QMainWindow):
         self._frames_tree.setItemWidget(item, 0, wrapper)
 
     def _on_tree_item_clicked(self, item: QTreeWidgetItem) -> None:
-        frame = item.data(0, Qt.UserRole)
-        if frame is None:
+        data = item.data(0, Qt.UserRole)
+        if data is None:
             self._update_properties("Nenhum item selecionado")
             self._update_interest_actions_enabled()
             return
         if not self._media_loaded:
             self._update_interest_actions_enabled()
             return
+        
+        # Handle both old format (int) and new format (dict)
+        if isinstance(data, int):
+            frame = data
+            item_type = "frame"
+        else:
+            frame = data.get("frame")
+            item_type = data.get("type", "frame")
+        
         position_ms = self._frame_to_ms(int(frame))
         self._player_controller.set_position(position_ms)
         self._update_frame_label(position_ms)
         self._update_time_label(position_ms, self._position_slider.maximum())
-        self._update_properties(f"Frame: {frame}")
+        
+        # Update properties based on item type
+        if item_type == "annotation":
+            annotation = data.get("annotation", {})
+            self._update_properties(self._format_annotation_properties(annotation))
+        else:
+            self._update_properties(f"Frame: {frame}")
+        
         self._update_interest_actions_enabled()
+
+    def _format_annotation_properties(self, annotation: dict) -> str:
+        """Format annotation details for the properties panel."""
+        ann_type = annotation.get("type", "unknown")
+        lines = []
+        
+        type_names = {"point": "Ponto", "line": "Reta", "angle": "Ângulo", "freehand": "Máscara", "brush": "Brush"}
+        lines.append(f"Tipo: {type_names.get(ann_type, ann_type)}")
+        
+        if annotation.get("name"):
+            lines.append(f"Nome: {annotation['name']}")
+        
+        if ann_type == "point":
+            lines.append(f"Posição: ({annotation.get('x', 0):.1f}, {annotation.get('y', 0):.1f})")
+            lines.append(f"Tamanho: {annotation.get('size', 3)}")
+            color = annotation.get('color')
+            if color:
+                lines.append(f"Cor: {color.name()}")
+    
+        return "\n".join(lines)
 
     def _is_supported_video(self, path: Path) -> bool:
         return path.suffix.lower() in {".mp4", ".avi"}
@@ -622,48 +858,156 @@ class MainWindow(QMainWindow):
         item = self._frames_tree.currentItem()
         if not item:
             return
-        frame = item.data(0, Qt.UserRole)
-        if frame is None:
+        data = item.data(0, Qt.UserRole)
+        if data is None:
             return
-        entry = next((e for e in self._saved_frames if e["frame"] == frame), None)
-        if entry is None:
+        
+        # Handle both old format (int) and new format (dict)
+        if isinstance(data, int):
+            # Old format - frame only
+            frame = data
+            entry = next((e for e in self._saved_frames if e["frame"] == frame), None)
+            if entry is None:
+                return
+            current_name = entry.get("name") or ""
+            name, ok = QInputDialog.getText(self, "Renomear frame", "Nome:", text=current_name)
+            if not ok:
+                return
+            entry["name"] = name.strip() or None
+            self._rebuild_frames_tree()
+            self._update_interest_actions_enabled()
+            
+        elif data.get("type") == "frame":
+            frame = data["frame"]
+            entry = next((e for e in self._saved_frames if e["frame"] == frame), None)
+            if entry is None:
+                return
+            current_name = entry.get("name") or ""
+            name, ok = QInputDialog.getText(self, "Renomear frame", "Nome:", text=current_name)
+            if not ok:
+                return
+            entry["name"] = name.strip() or None
+            self._rebuild_frames_tree()
+            self._update_interest_actions_enabled()
+            
+        elif data.get("type") == "annotation":
+            frame = data.get("frame")
+            annotation_data = data.get("annotation")
+            if annotation_data is None or frame is None:
+                return
+            
+            # Find the annotation in self._annotations by id and type
+            ann_id = annotation_data.get("id")
+            ann_type = annotation_data.get("type")
+            
+            frame_annotations = self._annotations.get(frame, [])
+            annotation = next(
+                (a for a in frame_annotations if a.get("id") == ann_id and a.get("type") == ann_type),
+                None
+            )
+            
+            if annotation is None:
+                return
+            
+            current_name = annotation.get("name") or ""
+            type_names = {"point": "Ponto", "line": "Reta", "angle": "Ângulo", "freehand": "Máscara", "brush": "Brush"}
+            type_label = type_names.get(ann_type, "Item")
+            name, ok = QInputDialog.getText(self, f"Renomear {type_label.lower()}", "Nome:", text=current_name)
+            if not ok:
+                return
+            
+            annotation["name"] = name.strip() or None
+            
+            # Rebuild and reselect
+            self._rebuild_frames_tree()
+            
+            # Manually select the renamed item
+            self._select_annotation_in_tree(frame, ann_id, ann_type)
+            self._update_interest_actions_enabled()
+
+    def _select_annotation_in_tree(self, frame: int, ann_id: int, ann_type: str) -> None:
+        """Select a specific annotation in the tree by its identifiers."""
+        if not self._tree_root:
             return
-        current_name = entry.get("name") or ""
-        name, ok = QInputDialog.getText(self, "Renomear frame", "Nome:", text=current_name)
-        if not ok:
-            return
-        entry["name"] = name.strip() or None
-        self._rebuild_frames_tree()
-        self._update_interest_actions_enabled()
+        
+        for i in range(self._tree_root.childCount()):
+            frame_item = self._tree_root.child(i)
+            frame_data = frame_item.data(0, Qt.UserRole)
+            if isinstance(frame_data, dict) and frame_data.get("frame") == frame:
+                for j in range(frame_item.childCount()):
+                    ann_item = frame_item.child(j)
+                    ann_data = ann_item.data(0, Qt.UserRole)
+                    if isinstance(ann_data, dict) and ann_data.get("type") == "annotation":
+                        annotation = ann_data.get("annotation", {})
+                        if annotation.get("id") == ann_id and annotation.get("type") == ann_type:
+                            self._frames_tree.setCurrentItem(ann_item)
+                            return
 
     def _delete_selected_frame(self) -> None:
         item = self._frames_tree.currentItem()
         if not item:
             return
-        frame = item.data(0, Qt.UserRole)
-        if frame is None:
+        data = item.data(0, Qt.UserRole)
+        if data is None:
             return
-        self._saved_frames = [e for e in self._saved_frames if e["frame"] != frame]
+        
+        # Handle both old format (int) and new format (dict)
+        if isinstance(data, int):
+            frame = data
+            self._saved_frames = [e for e in self._saved_frames if e["frame"] != frame]
+            if frame in self._annotations:
+                del self._annotations[frame]
+        elif data.get("type") == "frame":
+            frame = data["frame"]
+            self._saved_frames = [e for e in self._saved_frames if e["frame"] != frame]
+            if frame in self._annotations:
+                del self._annotations[frame]
+        elif data.get("type") == "annotation":
+            frame = data["frame"]
+            annotation = data.get("annotation")
+            if frame in self._annotations and annotation in self._annotations[frame]:
+                self._annotations[frame].remove(annotation)
+                # If no more annotations, keep the frame (user saved it for a reason)
+        
         self._rebuild_frames_tree()
         self._update_interest_actions_enabled()
         self._update_properties("Nenhum item selecionado")
+        
+        # Update video view
+        self._video_view.set_annotations(self._annotations.get(self._current_frame, []))
 
     def _has_selected_interest(self) -> bool:
         item = self._frames_tree.currentItem()
         if not item:
             return False
-        return item.data(0, Qt.UserRole) is not None
+        data = item.data(0, Qt.UserRole)
+        if data is None:
+            return False
+        # Accept both old format (int) and new format (dict with type)
+        if isinstance(data, int):
+            return True
+        return data.get("type") in ("frame", "annotation")
 
     def _on_selection_toggled(self, checked: bool) -> None:
         if checked:
             self._video_view.set_hand_mode(False)
             self._hand_btn.setChecked(False)
             self._video_view.viewport().setCursor(Qt.ArrowCursor)
+            self._video_view.set_annotation_mode(False)
 
     def _on_hand_toggled(self, checked: bool) -> None:
         self._video_view.set_hand_mode(checked)
+        self._video_view.set_annotation_mode(False)
         if checked:
             self._selection_btn.setChecked(False)
+
+    def _on_point_toggled(self, checked: bool) -> None:
+        if checked:
+            self._video_view.set_hand_mode(False)
+            self._video_view.set_annotation_mode(True)
+            self._video_view.viewport().setCursor(Qt.CrossCursor)
+        else:
+            self._video_view.set_annotation_mode(False)
 
     def _update_interest_actions_enabled(self) -> None:
         selected = self._frames_tree.currentItem()
