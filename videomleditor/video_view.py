@@ -99,10 +99,7 @@ class VideoView(QGraphicsView):
         rect = self._video_item.boundingRect()
         if rect.isEmpty():
             return False
-        
-        # Fix the scene rect to prevent automatic expansion when items are added
         self._fix_scene_rect()
-        
         self.fitInView(self._video_item, Qt.KeepAspectRatio)
         return True
 
@@ -698,7 +695,6 @@ class VideoView(QGraphicsView):
             elif ann_type == "angle":
                 self._draw_angle(annotation)
         
-        # Fix scene rect to prevent unwanted scrolling
         self._fix_scene_rect()
 
     def set_mask(self, mask_data: dict | None) -> None:
@@ -728,8 +724,6 @@ class VideoView(QGraphicsView):
         self._mask_item.setBrush(Qt.NoBrush)
         self._mask_item.setZValue(100)
         self._scene.addItem(self._mask_item)
-        
-        # Fix scene rect to prevent unwanted scrolling
         self._fix_scene_rect()
 
     def _draw_point(self, annotation: dict) -> None:
@@ -832,7 +826,7 @@ class VideoView(QGraphicsView):
         return 0, 0
     
     def get_video_debug_info(self) -> dict:
-        """Get debug information about video dimensions."""
+        """Get debug information about video dimensions including boundingRect offset."""
         native_size = self._video_item.nativeSize()
         rect = self._video_item.boundingRect()
         return {

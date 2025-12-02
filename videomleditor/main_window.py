@@ -846,31 +846,9 @@ class MainWindow(QMainWindow):
         display_width, display_height = self._video_view.get_display_size()
         debug_info = self._video_view.get_video_debug_info()
         
-        # Get the boundingRect offset - this is crucial!
-        # The video item's boundingRect may not start at (0, 0)
+        # Get the boundingRect offset
         rect_left = debug_info.get("boundingRect_left", 0)
         rect_top = debug_info.get("boundingRect_top", 0)
-        
-        path_rect = path.boundingRect()
-        
-        # Debug info for user
-        debug_msg = (
-            f"Informações de dimensões:\n\n"
-            f"Native size: {native_width}x{native_height}\n"
-            f"Display size (boundingRect): {display_width}x{display_height}\n"
-            f"BoundingRect offset: ({rect_left:.1f}, {rect_top:.1f})\n\n"
-            f"Path bounding rect:\n"
-            f"  De: ({path_rect.left():.1f}, {path_rect.top():.1f})\n"
-            f"  Até: ({path_rect.right():.1f}, {path_rect.bottom():.1f})\n\n"
-            f"Deseja continuar com a exportação?"
-        )
-        
-        reply = QMessageBox.question(
-            self, "Debug - Exportar Máscara", debug_msg,
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
-        )
-        if reply != QMessageBox.Yes:
-            return
         
         # Validate dimensions
         if display_width <= 0 or display_height <= 0:
@@ -908,19 +886,11 @@ class MainWindow(QMainWindow):
         scale_y = output_height / display_height
         
         # Build the transformation:
-        # We need: 1) subtract offset (normalize to 0,0), then 2) scale to output size
-        # 
-        # IMPORTANT: QTransform applies transformations in REVERSE order!
-        # So we must add scale FIRST, then translate, to get:
-        #   result = scale(translate(point))
-        #
-        # For point (47.3, 30) with offset (40, 0) and scale 2.133:
-        #   1. translate: (47.3 - 40, 30 - 0) = (7.3, 30)
-        #   2. scale: (7.3 * 2.133, 30 * 2.133) = (15.6, 64)
-        
+        # QTransform applies transformations in REVERSE order
+        # So: scale first (applied second), translate second (applied first)
         transform = QTransform()
-        transform.scale(scale_x, scale_y)  # Applied SECOND (after translate)
-        transform.translate(-rect_left, -rect_top)  # Applied FIRST (normalize to 0,0)
+        transform.scale(scale_x, scale_y)
+        transform.translate(-rect_left, -rect_top)
         
         # Apply transformation and draw
         transformed_path = transform.map(path)
@@ -930,8 +900,7 @@ class MainWindow(QMainWindow):
         
         # Save image
         if image.save(file_path):
-            msg = f"Salvo: {output_width}x{output_height} (offset: {rect_left:.0f},{rect_top:.0f}, scale: {scale_x:.2f}x{scale_y:.2f})"
-            self.statusBar().showMessage(msg, 8000)
+            self.statusBar().showMessage(f"Máscara salva em: {file_path} ({output_width}x{output_height})", 5000)
         else:
             QMessageBox.warning(self, "Erro", "Não foi possível salvar a máscara.")
 
