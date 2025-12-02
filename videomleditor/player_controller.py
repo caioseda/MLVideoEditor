@@ -32,6 +32,8 @@ class VideoPlayerController(QObject):
         self._frame_interval_ms: float = 1000.0 / self._DEFAULT_FRAME_RATE
         self._current_path: Optional[Path] = None
         self._loop_enabled: bool = False
+        self._pending_seek_position: Optional[int] = None  # Track pending seek for play fix
+        self._first_frame_shown: bool = False  # Track if first frame was displayed
 
         self._player.positionChanged.connect(self.position_changed.emit)
         self._player.durationChanged.connect(self.duration_changed.emit)
@@ -57,13 +59,24 @@ class VideoPlayerController(QObject):
     def load(self, file_path: str | Path) -> None:
         """Load a local video file."""
         self._current_path = Path(file_path)
+        self._first_frame_shown = False  # Reset flag for new video
+        self._pending_seek_position = None
         if hasattr(self._player, "setSource"):
             self._player.setSource(QUrl.fromLocalFile(str(self._current_path)))
         self._apply_loop_setting()
 
     def play(self) -> None:
         if hasattr(self._player, "play"):
-            self._player.play()
+            # If there was a pending seek while paused, re-apply it after starting play
+            # This fixes the black screen issue after seek + play
+            if self._pending_seek_position is not None:
+                target_position = self._pending_seek_position
+                self._pending_seek_position = None
+                self._player.play()
+                # Re-apply the position after play starts to ensure proper rendering
+                self._player.setPosition(target_position)
+            else:
+                self._player.play()
 
     def pause(self) -> None:
         if hasattr(self._player, "pause"):
@@ -74,6 +87,10 @@ class VideoPlayerController(QObject):
         if position_ms < 0:
             position_ms = 0
         self._player.setPosition(position_ms)
+        # Track the seek position in case we need to re-apply it on play
+        # This helps fix black screen issues after seek while paused
+        if not self.is_playing():
+            self._pending_seek_position = position_ms
 
     def skip_frames(self, frame_offset: int) -> None:
         """Move forward/backward by a number of frames, respecting video duration."""
@@ -83,6 +100,9 @@ class VideoPlayerController(QObject):
         delta_ms = int(frame_offset * self._frame_interval_ms)
         new_position = max(0, min(self._player.duration(), self._player.position() + delta_ms))
         self._player.setPosition(new_position)
+        # Track the seek position in case we need to re-apply it on play
+        if not self.is_playing():
+            self._pending_seek_position = new_position
 
     def is_playing(self) -> bool:
         if hasattr(self._player, "playbackState"):
@@ -100,6 +120,9 @@ class VideoPlayerController(QObject):
             QMediaPlayer.MediaStatus.LoadedMedia,
         ):
             self._update_frame_interval()
+            # Show first frame when video is loaded
+            if not self._first_frame_shown:
+                self._show_first_frame()
         elif status == QMediaPlayer.MediaStatus.EndOfMedia:
             if not self._loop_enabled:
                 # Stop at the last frame instead of looping back.
@@ -107,6 +130,18 @@ class VideoPlayerController(QObject):
                 if duration > 0:
                     self._player.setPosition(duration)
                 self._player.pause()
+
+    def _show_first_frame(self) -> None:
+        """Display the first frame of the video by doing a quick play/pause."""
+        if self._first_frame_shown:
+            return
+        self._first_frame_shown = True
+        # Play and immediately pause to render the first frame
+        if hasattr(self._player, "play") and hasattr(self._player, "pause"):
+            self._player.play()
+            self._player.pause()
+            self._player.setPosition(0)
+            self._pending_seek_position = None  # Clear any pending seek
 
     def _handle_error(self, error: QMediaPlayer.Error, error_string: str) -> None:
         if error != QMediaPlayer.NoError:
